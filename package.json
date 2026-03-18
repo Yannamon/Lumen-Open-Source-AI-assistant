@@ -1,0 +1,27 @@
+{
+  "name": "virtual-assistant-beta",
+  "version": "1.0.0",
+  "description": "Local voice-enabled personal assistant powered by an LM Studio server.",
+  "private": true,
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('.next',{ recursive: true, force: true })\"",
+    "dev": "npm run clean && node scripts/dev-server.js",
+    "dev:next": "npm run clean && next dev",
+    "build": "node -e \"require('fs').rmSync('.next',{ recursive: true, force: true })\" && next build && node scripts/prepare-standalone.js",
+    "start": "next start",
+    "prepare:standalone": "node scripts/prepare-standalone.js",
+    "typecheck": "next typegen && tsc --noEmit",
+    "legacy:start": "node server.js"
+  },
+  "dependencies": {
+    "next": "^15.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "typescript": "^5.8.2"
+  }
+}
