@@ -39,6 +39,8 @@ const state = {
   models: [],
   speechModels: [],
   voices: [],
+  visualExamples: null,
+  visualDownloadUrl: null,
   microphones: [],
   recognition: null,
   isListening: false,
@@ -106,6 +108,15 @@ const elements = {
   clearChat: document.querySelector("#clear-chat"),
   listeningIndicator: document.querySelector("#listening-indicator"),
   liveTranscript: document.querySelector("#live-transcript"),
+  visualExamplesScreen: document.querySelector("#visual-examples-screen"),
+  visualScreenTitle: document.querySelector("#visual-screen-title"),
+  visualScreenKind: document.querySelector("#visual-screen-kind"),
+  visualScreenSummary: document.querySelector("#visual-screen-summary"),
+  visualScreenPreview: document.querySelector("#visual-screen-preview"),
+  visualScreenGrid: document.querySelector("#visual-screen-grid"),
+  visualScreenJson: document.querySelector("#visual-screen-json"),
+  downloadVisualJson: document.querySelector("#download-visual-json"),
+  hideVisualScreen: document.querySelector("#hide-visual-screen"),
   chatLog: document.querySelector("#chat-log"),
   composer: document.querySelector("#composer"),
   composerListenButton: document.querySelector("#composer-listen-button"),
@@ -123,6 +134,76 @@ const elements = {
   template: document.querySelector("#message-template"),
   shortcutTiles: document.querySelectorAll(".shortcut-tile"),
 };
+
+const SCRAPE_INTENT_PATTERN =
+  /\b(scrap(?:e|ing|ping)|web\s*scrap(?:e|ing|ping)|extract|crawl|parse\s+(?:this\s+)?(?:page|site|website)|pull\s+data|download\s+json|as\s+json|to\s+json)\b/i;
+const SCRAPE_CONTEXT_PATTERN =
+  /\b(url|link|page|site|website|html|json|data|content|headings|links|images|metadata)\b/i;
+
+function normalizeScrapeUrl(value) {
+  const rawValue = String(value || "").trim().replace(/[),.;!?]+$/, "");
+
+  if (!rawValue) {
+    return "";
+  }
+
+  const nextValue = /^[a-z]+:\/\//i.test(rawValue) ? rawValue : `https://${rawValue}`;
+
+  try {
+    const parsed = new URL(nextValue);
+
+    if (!/^https?:$/i.test(parsed.protocol)) {
+      return "";
+    }
+
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function extractUrlFromText(text) {
+  const source = String(text || "");
+  const directMatch = source.match(/https?:\/\/[^\s<>"']+/i);
+
+  if (directMatch?.[0]) {
+    return directMatch[0];
+  }
+
+  const domainMatch = source.match(
+    /\b(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s<>"']*)?/i
+  );
+
+  return domainMatch?.[0] || "";
+}
+
+function parseScrapeRequest(prompt) {
+  const text = String(prompt || "").trim();
+  const extractedUrl = extractUrlFromText(text);
+
+  if (!text || !extractedUrl) {
+    return null;
+  }
+
+  const hasDirectIntent = SCRAPE_INTENT_PATTERN.test(text);
+  const hasScrapeContext = SCRAPE_CONTEXT_PATTERN.test(text);
+  const isUrlOnly = text === extractedUrl || text === normalizeScrapeUrl(extractedUrl);
+
+  if (!hasDirectIntent && !hasScrapeContext && !isUrlOnly) {
+    return null;
+  }
+
+  const targetUrl = normalizeScrapeUrl(extractedUrl);
+
+  if (!targetUrl) {
+    return null;
+  }
+
+  return {
+    prompt: text,
+    url: targetUrl,
+  };
+}
 
 function readSettings() {
   try {
@@ -165,6 +246,656 @@ function saveSettings() {
       screenCaptureSurface: elements.screenCaptureSurface.value,
     })
   );
+}
+
+const VISUAL_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "be",
+  "for",
+  "from",
+  "help",
+  "how",
+  "i",
+  "if",
+  "in",
+  "into",
+  "is",
+  "it",
+  "me",
+  "my",
+  "of",
+  "on",
+  "or",
+  "please",
+  "show",
+  "that",
+  "the",
+  "this",
+  "to",
+  "use",
+  "visual",
+  "with",
+]);
+
+function toTitleCase(value) {
+  return String(value || "").replace(/\b[a-z]/g, (character) => character.toUpperCase());
+}
+
+function buildSeedSeries(prompt, count, minimum, maximum) {
+  const text = String(prompt || "").trim() || "visual";
+  const span = Math.max(maximum - minimum, 1);
+  let seed = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    seed = (seed * 33 + text.charCodeAt(index) + index) % 2147483647;
+  }
+
+  const values = [];
+  let current = seed || 97;
+
+  for (let index = 0; index < count; index += 1) {
+    current = (current * 48271 + 31) % 2147483647;
+    values.push(minimum + (current % (span + 1)));
+  }
+
+  return values;
+}
+
+function extractVisualKeywords(prompt, count = 4) {
+  const tokens =
+    String(prompt || "")
+      .toLowerCase()
+      .match(/[a-z0-9][a-z0-9-]*/g) || [];
+  const uniqueTokens = [];
+
+  tokens.forEach((token) => {
+    if (
+      token.length < 3 ||
+      VISUAL_STOP_WORDS.has(token) ||
+      uniqueTokens.includes(token)
+    ) {
+      return;
+    }
+
+    uniqueTokens.push(token);
+  });
+
+  return uniqueTokens.slice(0, count);
+}
+
+function describeVisualFocus(keywords) {
+  if (!keywords.length) {
+    return "the topic";
+  }
+
+  if (keywords.length === 1) {
+    return keywords[0];
+  }
+
+  if (keywords.length === 2) {
+    return `${keywords[0]} and ${keywords[1]}`;
+  }
+
+  return `${keywords.slice(0, -1).join(", ")}, and ${keywords[keywords.length - 1]}`;
+}
+
+function detectVisualRequest(prompt) {
+  const normalizedPrompt = String(prompt || "").toLowerCase();
+
+  if (!normalizedPrompt.trim()) {
+    return null;
+  }
+
+  let graphScore = 0;
+  let imageScore = 0;
+
+  if (
+    /\b(graph|chart|plot|dashboard|trend|timeline|histogram|scatter|bar chart|line chart|pie chart|breakdown)\b/.test(
+      normalizedPrompt
+    )
+  ) {
+    graphScore += 3;
+  }
+
+  if (
+    /\b(compare|comparison|forecast|projection|distribution|percent|rate|growth|revenue|sales|traffic|users|population|monthly|weekly|quarterly|yearly)\b/.test(
+      normalizedPrompt
+    )
+  ) {
+    graphScore += 1;
+  }
+
+  if (
+    /\b(image|photo|picture|illustration|poster|mockup|render|portrait|thumbnail|logo|diagram|infographic|scene|screenshot|wireframe)\b/.test(
+      normalizedPrompt
+    )
+  ) {
+    imageScore += 3;
+  }
+
+  if (
+    /\b(concept|style|composition|layout|brand|cover|look and feel|visualize|show me visually)\b/.test(
+      normalizedPrompt
+    )
+  ) {
+    imageScore += 1;
+  }
+
+  if (!graphScore && !imageScore) {
+    return null;
+  }
+
+  return {
+    kind: graphScore >= imageScore ? "graph" : "image",
+    prompt: String(prompt || "").trim(),
+  };
+}
+
+function createVisualSuggestionCard(card) {
+  const article = document.createElement("article");
+  article.className = "visual-suggestion-card";
+
+  const eyebrow = document.createElement("span");
+  eyebrow.className = "visual-card-kicker";
+  eyebrow.textContent = card.kicker;
+
+  const title = document.createElement("strong");
+  title.className = "visual-card-title";
+  title.textContent = card.title;
+
+  const description = document.createElement("p");
+  description.className = "visual-card-description";
+  description.textContent = card.description;
+
+  article.append(eyebrow, title, description);
+  return article;
+}
+
+function createGraphCanvas(model) {
+  const canvas = document.createElement("div");
+  canvas.className = "visual-canvas visual-canvas-graph";
+
+  const grid = document.createElement("div");
+  grid.className = "visual-chart-grid";
+
+  for (let index = 0; index < 4; index += 1) {
+    const line = document.createElement("span");
+    line.className = "visual-chart-grid-line";
+    grid.appendChild(line);
+  }
+
+  const bars = document.createElement("div");
+  bars.className = "visual-chart-bars";
+
+  model.points.forEach((point) => {
+    const group = document.createElement("div");
+    group.className = "visual-chart-bar-group";
+
+    const bar = document.createElement("span");
+    bar.className = "visual-chart-bar";
+    bar.style.setProperty("--bar-height", `${point.value}%`);
+
+    const label = document.createElement("span");
+    label.className = "visual-chart-label";
+    label.textContent = point.label;
+
+    group.append(bar, label);
+    bars.appendChild(group);
+  });
+
+  const chips = document.createElement("div");
+  chips.className = "visual-chip-row";
+
+  model.chips.forEach((chip) => {
+    const chipNode = document.createElement("span");
+    chipNode.className = "visual-chip";
+    chipNode.textContent = chip;
+    chips.appendChild(chipNode);
+  });
+
+  canvas.append(grid, bars, chips);
+  return canvas;
+}
+
+function createImageCanvas(model) {
+  const canvas = document.createElement("div");
+  canvas.className = "visual-canvas visual-canvas-image";
+
+  const halo = document.createElement("span");
+  halo.className = "visual-image-halo";
+
+  const framePrimary = document.createElement("div");
+  framePrimary.className = "visual-image-frame visual-image-frame-primary";
+  framePrimary.textContent = model.primaryLabel;
+
+  const frameSecondary = document.createElement("div");
+  frameSecondary.className = "visual-image-frame visual-image-frame-secondary";
+  frameSecondary.textContent = model.secondaryLabel;
+
+  const frameAccent = document.createElement("div");
+  frameAccent.className = "visual-image-frame visual-image-frame-accent";
+  frameAccent.textContent = model.accentLabel;
+
+  const chipRow = document.createElement("div");
+  chipRow.className = "visual-chip-row";
+
+  model.chips.forEach((chip) => {
+    const chipNode = document.createElement("span");
+    chipNode.className = "visual-chip";
+    chipNode.textContent = chip;
+    chipRow.appendChild(chipNode);
+  });
+
+  canvas.append(halo, framePrimary, frameSecondary, frameAccent, chipRow);
+  return canvas;
+}
+
+function buildVisualExampleModel(prompt, request) {
+  const keywords = extractVisualKeywords(prompt);
+  const focus = describeVisualFocus(keywords);
+
+  if (request.kind === "graph") {
+    const labels =
+      keywords.length >= 4
+        ? keywords.slice(0, 4).map(toTitleCase)
+        : ["Signal", "Shift", "Peak", "Outcome"];
+    const points = buildSeedSeries(prompt, 4, 28, 88).map((value, index) => ({
+      label: labels[index],
+      value,
+    }));
+
+    return {
+      kind: "graph",
+      badge: "Graph examples",
+      title: "Chart-ready visual examples",
+      summary: `This request sounds data-driven, so the hidden visual screen opened with chart directions for ${focus}.`,
+      showcaseTitle: "Suggested chart layout",
+      showcaseText:
+        "Lead with the big movement, keep labels short, and annotate the most important jump or drop.",
+      chips: ["Trend", "Comparison", "Highlight"],
+      points,
+      cards: [
+        {
+          kicker: "Trend",
+          title: `Track ${toTitleCase(keywords[0] || "Momentum")}`,
+          description:
+            "Use a simple trend view when the answer depends on change over time or a single rising or falling signal.",
+        },
+        {
+          kicker: "Compare",
+          title: "Show category gaps",
+          description:
+            "A grouped or stacked comparison makes it easier to spot leaders, laggards, and distribution at a glance.",
+        },
+        {
+          kicker: "Explain",
+          title: "Annotate the takeaway",
+          description:
+            "Add one short callout near the peak so the user understands the conclusion without reading a long paragraph.",
+        },
+      ],
+    };
+  }
+
+  return {
+    kind: "image",
+    badge: "Image examples",
+    title: "Image-ready visual examples",
+    summary: `This request sounds easier to explain with imagery, so the hidden visual screen opened with composition ideas for ${focus}.`,
+    showcaseTitle: "Suggested composition",
+    showcaseText:
+      "Use one clear hero subject, one supporting detail, and a caption area that frames the scene without crowding it.",
+    chips: ["Hero frame", "Detail crop", "Caption layer"],
+    primaryLabel: toTitleCase(keywords[0] || "Hero subject"),
+    secondaryLabel: toTitleCase(keywords[1] || "Scene detail"),
+    accentLabel: toTitleCase(keywords[2] || "Context note"),
+    cards: [
+      {
+        kicker: "Hero",
+        title: "Start with one focal point",
+        description:
+          "Put the main object or idea in the strongest position first, then let secondary elements support it.",
+      },
+      {
+        kicker: "Detail",
+        title: "Include a close-up variation",
+        description:
+          "A second crop helps answer follow-up questions about texture, labels, controls, or key visual cues.",
+      },
+      {
+        kicker: "Explain",
+        title: "Layer in quick annotations",
+        description:
+          "Short labels or captions make the image useful for teaching, not just for decoration.",
+      },
+    ],
+  };
+}
+
+function truncateVisualText(value, maxLength = 180) {
+  const text = String(value || "").trim();
+
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trim()}...`;
+}
+
+function slugifyFilePart(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+}
+
+function resetVisualScreenContent() {
+  elements.visualScreenPreview.innerHTML = "";
+  elements.visualScreenGrid.innerHTML = "";
+  elements.visualScreenJson.textContent = "";
+  elements.visualScreenJson.hidden = true;
+
+  if (state.visualDownloadUrl) {
+    URL.revokeObjectURL(state.visualDownloadUrl);
+    state.visualDownloadUrl = null;
+  }
+
+  elements.downloadVisualJson.hidden = true;
+  delete elements.downloadVisualJson.dataset.filename;
+}
+
+function setVisualJsonDownload(data, filename) {
+  const serialized = JSON.stringify(data, null, 2);
+  const blob = new Blob([serialized], { type: "application/json" });
+
+  if (state.visualDownloadUrl) {
+    URL.revokeObjectURL(state.visualDownloadUrl);
+  }
+
+  state.visualDownloadUrl = URL.createObjectURL(blob);
+  elements.downloadVisualJson.hidden = false;
+  elements.downloadVisualJson.dataset.filename = filename || "visual-data.json";
+  elements.visualScreenJson.textContent = serialized;
+  elements.visualScreenJson.hidden = false;
+}
+
+function createVisualStat(label, value) {
+  const card = document.createElement("div");
+  card.className = "visual-stat-card";
+
+  const labelNode = document.createElement("span");
+  labelNode.className = "visual-stat-label";
+  labelNode.textContent = label;
+
+  const valueNode = document.createElement("strong");
+  valueNode.className = "visual-stat-value";
+  valueNode.textContent = value;
+
+  card.append(labelNode, valueNode);
+  return card;
+}
+
+function hideVisualExamples() {
+  state.visualExamples = null;
+  elements.visualExamplesScreen.hidden = true;
+  resetVisualScreenContent();
+}
+
+function renderVisualExamples(model) {
+  if (!model) {
+    hideVisualExamples();
+    return;
+  }
+
+  elements.visualExamplesScreen.hidden = false;
+  elements.visualScreenTitle.textContent = model.title;
+  elements.visualScreenKind.textContent = model.badge;
+  elements.visualScreenSummary.textContent = model.summary;
+  resetVisualScreenContent();
+
+  const showcase = document.createElement("article");
+  showcase.className = "visual-showcase-card";
+
+  const canvas =
+    model.kind === "graph" ? createGraphCanvas(model) : createImageCanvas(model);
+  const copy = document.createElement("div");
+  copy.className = "visual-showcase-copy";
+
+  const title = document.createElement("strong");
+  title.className = "visual-showcase-title";
+  title.textContent = model.showcaseTitle;
+
+  const text = document.createElement("p");
+  text.className = "visual-showcase-text";
+  text.textContent = model.showcaseText;
+
+  copy.append(title, text);
+  showcase.append(canvas, copy);
+  elements.visualScreenPreview.appendChild(showcase);
+
+  model.cards.forEach((card) => {
+    elements.visualScreenGrid.appendChild(createVisualSuggestionCard(card));
+  });
+}
+
+function renderVisualLoadingState(title, badge, summary) {
+  elements.visualExamplesScreen.hidden = false;
+  elements.visualScreenTitle.textContent = title;
+  elements.visualScreenKind.textContent = badge;
+  elements.visualScreenSummary.textContent = summary;
+  resetVisualScreenContent();
+
+  const showcase = document.createElement("article");
+  showcase.className = "visual-showcase-card";
+
+  const copy = document.createElement("div");
+  copy.className = "visual-showcase-copy";
+
+  const loading = document.createElement("strong");
+  loading.className = "visual-showcase-title";
+  loading.textContent = "Preparing visual data";
+
+  const text = document.createElement("p");
+  text.className = "visual-showcase-text";
+  text.textContent =
+    "Fetching the page, extracting structured content, and getting the JSON file ready.";
+
+  copy.append(loading, text);
+  showcase.append(copy);
+  elements.visualScreenPreview.appendChild(showcase);
+}
+
+function renderVisualErrorState(title, badge, summary, bodyText) {
+  elements.visualExamplesScreen.hidden = false;
+  elements.visualScreenTitle.textContent = title;
+  elements.visualScreenKind.textContent = badge;
+  elements.visualScreenSummary.textContent = summary;
+  resetVisualScreenContent();
+
+  const showcase = document.createElement("article");
+  showcase.className = "visual-showcase-card";
+
+  const copy = document.createElement("div");
+  copy.className = "visual-showcase-copy";
+
+  const errorTitle = document.createElement("strong");
+  errorTitle.className = "visual-showcase-title";
+  errorTitle.textContent = "No structured data was captured";
+
+  const text = document.createElement("p");
+  text.className = "visual-showcase-text";
+  text.textContent = bodyText;
+
+  copy.append(errorTitle, text);
+  showcase.append(copy);
+  elements.visualScreenPreview.appendChild(showcase);
+}
+
+function renderScrapeVisualResult(scrape) {
+  const product = scrape.product || {};
+  const productName = product.name || scrape.title || scrape.finalUrl;
+  const productDescription =
+    product.description ||
+    scrape.description ||
+    scrape.excerpt ||
+    "The page was scraped successfully and formatted as JSON.";
+  const productPrice = product.price || "Not found";
+  const headingText = (scrape.headings || [])
+    .slice(0, 3)
+    .map((entry) => entry.text)
+    .join(" | ");
+  const linkText = (scrape.links || [])
+    .slice(0, 3)
+    .map((entry) => entry.text || entry.url)
+    .join(" | ");
+  const imageText = (scrape.images || [])
+    .slice(0, 3)
+    .map((entry) => entry.alt || entry.url)
+    .join(" | ");
+
+  state.visualExamples = {
+    kind: "scrape",
+    scrape,
+  };
+  elements.visualExamplesScreen.hidden = false;
+  elements.visualScreenTitle.textContent = "Web scrape result";
+  elements.visualScreenKind.textContent = product.isProductLike ? "Product JSON ready" : "JSON ready";
+  elements.visualScreenSummary.textContent = product.isProductLike
+    ? `Focused product details extracted from ${scrape.finalUrl}.`
+    : `Structured data extracted from ${scrape.finalUrl}.`;
+  resetVisualScreenContent();
+
+  const showcase = document.createElement("article");
+  showcase.className = "visual-showcase-card";
+
+  const stats = document.createElement("div");
+  stats.className = "visual-stats-grid";
+  stats.append(
+    createVisualStat("Status", String(scrape.status || "OK")),
+    createVisualStat(product.isProductLike ? "Price" : "Words", product.isProductLike ? productPrice : String(scrape.wordCount || 0)),
+    createVisualStat("Links", String(scrape.counts?.links || 0)),
+    createVisualStat("Images", String(scrape.counts?.images || 0))
+  );
+
+  const copy = document.createElement("div");
+  copy.className = "visual-showcase-copy";
+
+  const title = document.createElement("strong");
+  title.className = "visual-showcase-title";
+  title.textContent = productName;
+
+  const text = document.createElement("p");
+  text.className = "visual-showcase-text";
+  text.textContent = productDescription;
+
+  const urlNode = document.createElement("p");
+  urlNode.className = "visual-showcase-text";
+  urlNode.textContent = `Source: ${scrape.finalUrl}`;
+
+  copy.append(title, text, urlNode);
+  showcase.append(stats, copy);
+  elements.visualScreenPreview.appendChild(showcase);
+
+  [
+    {
+      kicker: "Product",
+      title: truncateVisualText(productName || "Untitled product", 70),
+      description: truncateVisualText(productDescription || "No product description was available.", 160),
+    },
+    {
+      kicker: "Price",
+      title: productPrice,
+      description: truncateVisualText(
+        [
+          product.priceAmount ? `Amount: ${product.priceAmount}` : "",
+          product.priceCurrency ? `Currency: ${product.priceCurrency}` : "",
+          product.availability ? `Availability: ${product.availability}` : "",
+        ]
+          .filter(Boolean)
+          .join(" | ") || "No structured price metadata was found.",
+        160
+      ),
+    },
+    {
+      kicker: "Description",
+      title: product.brand ? `Brand: ${product.brand}` : "Product summary",
+      description: truncateVisualText(productDescription || scrape.excerpt || "No product description was available.", 180),
+    },
+    {
+      kicker: "Headings",
+      title: `${scrape.counts?.headings || 0} heading${scrape.counts?.headings === 1 ? "" : "s"} found`,
+      description: truncateVisualText(headingText || "No headings were extracted.", 160),
+    },
+    {
+      kicker: "Links",
+      title: `${scrape.counts?.links || 0} link${scrape.counts?.links === 1 ? "" : "s"} captured`,
+      description: truncateVisualText(linkText || "No links were extracted.", 160),
+    },
+    {
+      kicker: "Images",
+      title: `${scrape.counts?.images || 0} image${scrape.counts?.images === 1 ? "" : "s"} captured`,
+      description: truncateVisualText(
+        product.imageUrl || imageText || "No images were extracted.",
+        160
+      ),
+    },
+  ].forEach((card) => {
+    elements.visualScreenGrid.appendChild(createVisualSuggestionCard(card));
+  });
+
+  const fileNameBase =
+    slugifyFilePart(productName) ||
+    slugifyFilePart(scrape.title) ||
+    slugifyFilePart(new URL(scrape.finalUrl).hostname) ||
+    "scrape-result";
+  setVisualJsonDownload(scrape, `${fileNameBase}.json`);
+}
+
+function updateVisualExamples(prompt) {
+  const request = detectVisualRequest(prompt);
+
+  if (!request) {
+    hideVisualExamples();
+    return null;
+  }
+
+  const model = buildVisualExampleModel(prompt, request);
+  state.visualExamples = model;
+  renderVisualExamples(model);
+  return model;
+}
+
+async function performScrapeRequest(request) {
+  renderVisualLoadingState(
+    "Web scrape result",
+    "Scraping",
+    `Extracting structured content from ${request.url}.`
+  );
+
+  const response = await fetch("/api/scrape", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+  });
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new Error(payload.details || payload.error || "Web scraping failed.");
+  }
+
+  if (!payload.scrape) {
+    throw new Error("The scraper returned an empty payload.");
+  }
+
+  renderScrapeVisualResult(payload.scrape);
+  return payload.scrape;
 }
 
 function renderMessage(role, content, sources = []) {
@@ -1406,12 +2137,13 @@ function buildMessages() {
 
 async function sendCurrentMessage() {
   const userText = elements.messageInput.value.trim();
+  const scrapeRequest = parseScrapeRequest(userText);
 
   if (!userText || state.isSending) {
     return;
   }
 
-  if (!elements.modelSelect.value) {
+  if (!scrapeRequest && !elements.modelSelect.value) {
     setStatus(elements.connectionStatus, "Select a chat model first.", true);
     return;
   }
@@ -1420,13 +2152,31 @@ async function sendCurrentMessage() {
   elements.sendButton.disabled = true;
   elements.listenButton.disabled = true;
   stopSpeaking();
+  const visualExamples = scrapeRequest ? null : updateVisualExamples(userText);
 
   state.messages.push({ role: "user", content: userText });
   rerenderChat();
   elements.messageInput.value = "";
-  elements.liveTranscript.textContent = "Thinking...";
+  elements.liveTranscript.textContent = scrapeRequest
+    ? "Scraping the page and preparing JSON..."
+    : visualExamples
+      ? "Thinking and preparing visual examples..."
+      : "Thinking...";
 
   try {
+    if (scrapeRequest) {
+      const scrape = await performScrapeRequest(scrapeRequest);
+      const assistantReply = `I scraped ${scrape.finalUrl} and displayed the structured result on the visualizer screen. Use Download JSON to save it.`;
+      state.messages.push({
+        role: "assistant",
+        content: assistantReply,
+      });
+      rerenderChat();
+      elements.liveTranscript.textContent = "Scrape ready.";
+      void speakText(assistantReply);
+      return;
+    }
+
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: {
@@ -1457,7 +2207,18 @@ async function sendCurrentMessage() {
     elements.liveTranscript.textContent = "Reply ready.";
     void speakText(assistantReply);
   } catch (error) {
-    const failureMessage = `I hit a problem reaching LM Studio: ${error.message}`;
+    if (scrapeRequest) {
+      renderVisualErrorState(
+        "Web scrape result",
+        "Scrape failed",
+        `I couldn't extract data from ${scrapeRequest.url}.`,
+        error.message
+      );
+    }
+
+    const failureMessage = scrapeRequest
+      ? `I couldn't scrape that page: ${error.message}`
+      : `I hit a problem reaching LM Studio: ${error.message}`;
     state.messages.push({ role: "assistant", content: failureMessage });
     rerenderChat();
     elements.liveTranscript.textContent = "Something went wrong.";
@@ -1560,13 +2321,30 @@ function attachEvents() {
   elements.composerListenButton.addEventListener("click", handleListenButtonClick);
 
   elements.stopSpeaking.addEventListener("click", stopSpeaking);
+  elements.downloadVisualJson.addEventListener("click", () => {
+    if (!state.visualDownloadUrl) {
+      return;
+    }
+
+    const link = document.createElement("a");
+    link.href = state.visualDownloadUrl;
+    link.target = "_self";
+    link.rel = "noopener";
+    link.download = elements.downloadVisualJson.dataset.filename || "visual-data.json";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  });
 
   elements.clearChat.addEventListener("click", () => {
     state.messages = [];
     stopSpeaking();
+    hideVisualExamples();
     elements.liveTranscript.textContent = "Start voice input or type a request below.";
     rerenderChat();
   });
+
+  elements.hideVisualScreen.addEventListener("click", hideVisualExamples);
 
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -1605,6 +2383,7 @@ function applySettings() {
   updateHeroTitle();
   clearScreenPreview();
   syncScreenTranscriptButtons();
+  hideVisualExamples();
 }
 
 async function initialize() {

@@ -98,6 +98,37 @@ const pageMarkup = `
         </p>
       </section>
 
+      <section id="visual-examples-screen" class="visual-screen" aria-live="polite" hidden>
+        <div class="section-head visual-screen-head">
+          <div>
+            <p class="eyebrow">Visual examples</p>
+            <h3 id="visual-screen-title">Image and graph ideas</h3>
+          </div>
+          <button id="hide-visual-screen" class="ghost-button visual-screen-dismiss" type="button">
+            Hide
+          </button>
+        </div>
+        <div class="visual-screen-meta">
+          <span id="visual-screen-kind" class="badge badge-soft">Preview</span>
+          <p id="visual-screen-summary" class="helper-text">
+            Visual examples will appear here when a prompt is better answered with an image or chart.
+          </p>
+        </div>
+        <div class="visual-screen-actions">
+          <button
+            id="download-visual-json"
+            class="ghost-button visual-json-download"
+            type="button"
+            hidden
+          >
+            Download JSON
+          </button>
+        </div>
+        <div id="visual-screen-preview" class="visual-screen-preview"></div>
+        <div id="visual-screen-grid" class="visual-screen-grid"></div>
+        <pre id="visual-screen-json" class="visual-screen-json" hidden></pre>
+      </section>
+
       <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
       <form id="composer" class="composer">

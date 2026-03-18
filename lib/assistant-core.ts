@@ -1808,8 +1808,565 @@ async function fetchTranscriptionService(pathname: string, options: any = {}) {
   return payload;
 }
 
+function normalizeScrapeUrl(value) {
+  const rawValue = typeof value === "string" ? value.trim() : "";
+
+  if (!rawValue) {
+    return "";
+  }
+
+  const normalizedValue = /^[a-z]+:\/\//i.test(rawValue) ? rawValue : `https://${rawValue}`;
+
+  try {
+    const parsed = new URL(normalizedValue);
+
+    if (!/^https?:$/i.test(parsed.protocol)) {
+      return "";
+    }
+
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function stripHtmlNoise(html) {
+  if (typeof html !== "string" || !html) {
+    return "";
+  }
+
+  return html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ");
+}
+
+function truncateText(value, maxLength = 240) {
+  const text = normalizeWhitespace(String(value || ""));
+
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trim()}...`;
+}
+
+function extractMetaContent(html, matcher) {
+  const source = String(html || "");
+  const patterns = [
+    new RegExp(
+      `<meta[^>]+${matcher}[^>]+content=["']([^"']+)["'][^>]*>`,
+      "i"
+    ),
+    new RegExp(
+      `<meta[^>]+content=["']([^"']+)["'][^>]+${matcher}[^>]*>`,
+      "i"
+    ),
+  ];
+
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+
+    if (match?.[1]) {
+      return cleanSearchText(match[1]);
+    }
+  }
+
+  return "";
+}
+
+function extractTagTextList(html, tagName, limit = 5) {
+  const source = stripHtmlNoise(html);
+  const pattern = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "gi");
+  const results = [];
+  let match;
+
+  while ((match = pattern.exec(source)) !== null && results.length < limit) {
+    const text = cleanSearchText(match[1]);
+
+    if (text) {
+      results.push(text);
+    }
+  }
+
+  return results;
+}
+
+function extractHeadingList(html, limit = 8) {
+  const source = stripHtmlNoise(html);
+  const pattern = /<(h[1-3])\b[^>]*>([\s\S]*?)<\/\1>/gi;
+  const results = [];
+  let match;
+
+  while ((match = pattern.exec(source)) !== null && results.length < limit) {
+    const text = cleanSearchText(match[2]);
+
+    if (!text) {
+      continue;
+    }
+
+    results.push({
+      level: match[1].toLowerCase(),
+      text,
+    });
+  }
+
+  return results;
+}
+
+function resolveAbsoluteUrl(rawUrl, baseUrl) {
+  const href = decodeHtmlEntities(String(rawUrl || "").trim());
+
+  if (!href || href.startsWith("#") || /^javascript:/i.test(href)) {
+    return "";
+  }
+
+  try {
+    const resolvedUrl = new URL(href, baseUrl);
+
+    if (!/^https?:$/i.test(resolvedUrl.protocol)) {
+      return "";
+    }
+
+    return resolvedUrl.toString();
+  } catch {
+    return "";
+  }
+}
+
+function extractLinkList(html, baseUrl, limit = 12) {
+  const source = stripHtmlNoise(html);
+  const pattern = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const results = [];
+  const seenUrls = new Set();
+  let match;
+
+  while ((match = pattern.exec(source)) !== null && results.length < limit) {
+    const url = resolveAbsoluteUrl(match[1], baseUrl);
+    const text = cleanSearchText(match[2]) || url;
+
+    if (!url || seenUrls.has(url)) {
+      continue;
+    }
+
+    seenUrls.add(url);
+    results.push({ text, url });
+  }
+
+  return results;
+}
+
+function extractImageList(html, baseUrl, limit = 8) {
+  const source = stripHtmlNoise(html);
+  const pattern = /<img\b[^>]*src=["']([^"']+)["'][^>]*>/gi;
+  const results = [];
+  const seenUrls = new Set();
+  let match;
+
+  while ((match = pattern.exec(source)) !== null && results.length < limit) {
+    const tag = match[0] || "";
+    const url = resolveAbsoluteUrl(match[1], baseUrl);
+    const altMatch = tag.match(/\balt=["']([^"']*)["']/i);
+    const alt = cleanSearchText(altMatch?.[1] || "");
+
+    if (!url || seenUrls.has(url)) {
+      continue;
+    }
+
+    seenUrls.add(url);
+    results.push({ alt, url });
+  }
+
+  return results;
+}
+
+function extractCanonicalUrl(html, baseUrl) {
+  const source = String(html || "");
+  const match = source.match(/<link\b[^>]*rel=["'][^"']*canonical[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>/i);
+
+  if (!match?.[1]) {
+    return "";
+  }
+
+  return resolveAbsoluteUrl(match[1], baseUrl);
+}
+
+function safeJsonParse(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSchemaToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^.*[\/#]/, "");
+}
+
+function flattenJsonLdNodes(node, results = []) {
+  if (!node) {
+    return results;
+  }
+
+  if (Array.isArray(node)) {
+    node.forEach((entry) => flattenJsonLdNodes(entry, results));
+    return results;
+  }
+
+  if (typeof node !== "object") {
+    return results;
+  }
+
+  results.push(node);
+
+  if (Array.isArray(node["@graph"])) {
+    flattenJsonLdNodes(node["@graph"], results);
+  }
+
+  return results;
+}
+
+function readSchemaTypes(node) {
+  const typeValue = node?.["@type"];
+
+  if (Array.isArray(typeValue)) {
+    return typeValue.map(normalizeSchemaToken);
+  }
+
+  if (typeof typeValue === "string") {
+    return [normalizeSchemaToken(typeValue)];
+  }
+
+  return [];
+}
+
+function extractJsonLdNodes(html) {
+  const source = String(html || "");
+  const pattern =
+    /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  const nodes = [];
+  let match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    const payload = safeJsonParse(match[1]?.trim());
+
+    if (!payload) {
+      continue;
+    }
+
+    flattenJsonLdNodes(payload, nodes);
+  }
+
+  return nodes;
+}
+
+function extractItemPropContent(html, propName) {
+  const source = String(html || "");
+  const patterns = [
+    new RegExp(
+      `<meta[^>]+itemprop=["']${propName}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+      "i"
+    ),
+    new RegExp(
+      `<[^>]+itemprop=["']${propName}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+      "i"
+    ),
+    new RegExp(
+      `<[^>]+itemprop=["']${propName}["'][^>]*>([\\s\\S]*?)<\\/[^>]+>`,
+      "i"
+    ),
+  ];
+
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+
+    if (match?.[1]) {
+      return cleanSearchText(match[1]);
+    }
+  }
+
+  return "";
+}
+
+function normalizePriceAmount(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  const rawValue = String(value).replace(/,/g, "").trim();
+  const numberMatch = rawValue.match(/-?\d+(?:\.\d+)?/);
+
+  if (!numberMatch) {
+    return "";
+  }
+
+  const amount = Number.parseFloat(numberMatch[0]);
+
+  if (!Number.isFinite(amount)) {
+    return "";
+  }
+
+  return amount.toFixed(amount % 1 === 0 ? 0 : 2);
+}
+
+function normalizeCurrencyCode(value) {
+  const rawValue = String(value || "").trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(rawValue) ? rawValue : "";
+}
+
+function formatProductPrice(amount, currency) {
+  const normalizedAmount = normalizePriceAmount(amount);
+  const normalizedCurrency = normalizeCurrencyCode(currency);
+
+  if (!normalizedAmount) {
+    return "";
+  }
+
+  if (normalizedCurrency) {
+    try {
+      return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: normalizedCurrency,
+      }).format(Number.parseFloat(normalizedAmount));
+    } catch {
+      return `${normalizedCurrency} ${normalizedAmount}`;
+    }
+  }
+
+  return normalizedAmount;
+}
+
+function extractPriceFromText(value) {
+  const text = String(value || "");
+  const directMatch = text.match(
+    /\b(?:USD|EUR|GBP|CAD|AUD|JPY)\s?\d{1,3}(?:[,\d]{0,12})(?:\.\d{2})?|\$\s?\d{1,3}(?:[,\d]{0,12})(?:\.\d{2})?|€\s?\d{1,3}(?:[,\d]{0,12})(?:\.\d{2})?|£\s?\d{1,3}(?:[,\d]{0,12})(?:\.\d{2})?/i
+  );
+
+  return directMatch ? normalizeWhitespace(directMatch[0]) : "";
+}
+
+function findProductJsonLdNode(html) {
+  const jsonLdNodes = extractJsonLdNodes(html);
+
+  return (
+    jsonLdNodes.find((node) => readSchemaTypes(node).includes("product")) || null
+  );
+}
+
+function readOfferNode(productNode) {
+  const offers = productNode?.offers;
+
+  if (Array.isArray(offers)) {
+    return offers.find((entry) => entry && typeof entry === "object") || null;
+  }
+
+  return offers && typeof offers === "object" ? offers : null;
+}
+
+function extractProductDetails({
+  html,
+  baseUrl,
+  title,
+  description,
+  headings,
+  paragraphs,
+  plainText,
+}) {
+  const productNode = findProductJsonLdNode(html);
+  const offerNode = readOfferNode(productNode);
+  const metaPriceAmount =
+    extractMetaContent(html, 'property=["\']product:price:amount["\']') ||
+    extractMetaContent(html, 'property=["\']og:price:amount["\']') ||
+    extractItemPropContent(html, "price");
+  const metaCurrency =
+    extractMetaContent(html, 'property=["\']product:price:currency["\']') ||
+    extractMetaContent(html, 'property=["\']og:price:currency["\']') ||
+    extractItemPropContent(html, "priceCurrency");
+  const normalizedAmount =
+    normalizePriceAmount(offerNode?.price) || normalizePriceAmount(metaPriceAmount);
+  const normalizedCurrency =
+    normalizeCurrencyCode(offerNode?.priceCurrency) ||
+    normalizeCurrencyCode(metaCurrency);
+  const formattedPrice =
+    formatProductPrice(normalizedAmount, normalizedCurrency) ||
+    extractPriceFromText(plainText);
+  const productName =
+    cleanSearchText(productNode?.name || "") ||
+    extractItemPropContent(html, "name") ||
+    headings?.[0]?.text ||
+    title;
+  const productDescription =
+    cleanSearchText(productNode?.description || "") ||
+    extractItemPropContent(html, "description") ||
+    description ||
+    paragraphs?.[0] ||
+    "";
+  const availability =
+    cleanSearchText(offerNode?.availability || "") ||
+    extractItemPropContent(html, "availability");
+  const brand =
+    cleanSearchText(productNode?.brand?.name || productNode?.brand || "") ||
+    extractItemPropContent(html, "brand");
+  const imageUrl = resolveAbsoluteUrl(
+    productNode?.image?.[0] || productNode?.image || extractItemPropContent(html, "image"),
+    baseUrl
+  );
+
+  const hasProductSignal = Boolean(
+    productNode ||
+      normalizedAmount ||
+      formattedPrice ||
+      extractMetaContent(html, 'property=["\']product:price:amount["\']') ||
+      extractItemPropContent(html, "price")
+  );
+
+  return {
+    isProductLike: hasProductSignal,
+    name: productName || "",
+    description: productDescription || "",
+    price: formattedPrice || "",
+    priceAmount: normalizedAmount || "",
+    priceCurrency: normalizedCurrency || "",
+    availability: availability || "",
+    brand: brand || "",
+    imageUrl: imageUrl || "",
+    source: productNode ? "json-ld" : hasProductSignal ? "meta-or-heuristic" : "generic",
+  };
+}
+
+function extractBodyText(html) {
+  const cleanedHtml = stripHtmlNoise(html);
+  const paragraphText = extractTagTextList(cleanedHtml, "p", 12);
+
+  if (paragraphText.length) {
+    return paragraphText;
+  }
+
+  const bodyMatch = cleanedHtml.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+  const bodyText = cleanSearchText(bodyMatch?.[1] || cleanedHtml);
+
+  if (!bodyText) {
+    return [];
+  }
+
+  return bodyText
+    .split(/(?<=[.!?])\s+/)
+    .map((entry) => normalizeWhitespace(entry))
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function countWordsInEntries(entries) {
+  return entries
+    .join(" ")
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+async function fetchScrapePayload(targetUrl) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      },
+    });
+    const html = await response.text();
+
+    return { response, html };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function createResult(status, body) {
   return { status, body };
+}
+
+export async function postScrapeResult(body) {
+  try {
+    const requestedUrl = normalizeScrapeUrl(body?.url);
+
+    if (!requestedUrl) {
+      return createResult(400, {
+        error: "A valid http or https URL is required for scraping.",
+      });
+    }
+
+    const { response, html } = await fetchScrapePayload(requestedUrl);
+    const finalUrl = normalizeScrapeUrl(response.url) || requestedUrl;
+    const contentType = response.headers.get("content-type") || "";
+    const title =
+      extractTagTextList(html, "title", 1)[0] ||
+      extractMetaContent(html, 'property=["\']og:title["\']') ||
+      "Untitled page";
+    const description =
+      extractMetaContent(html, 'name=["\']description["\']') ||
+      extractMetaContent(html, 'property=["\']og:description["\']');
+    const headings = extractHeadingList(html, 8);
+    const paragraphs = extractBodyText(html).slice(0, 8);
+    const links = extractLinkList(html, finalUrl, 12);
+    const images = extractImageList(html, finalUrl, 8);
+    const canonicalUrl = extractCanonicalUrl(html, finalUrl) || finalUrl;
+    const plainText = cleanSearchText(stripHtmlNoise(html));
+    const wordCount = countWordsInEntries(paragraphs.length ? paragraphs : [plainText]);
+    const product = extractProductDetails({
+      html,
+      baseUrl: finalUrl,
+      title,
+      description,
+      headings,
+      paragraphs,
+      plainText,
+    });
+    const scrape = {
+      requestedUrl,
+      finalUrl,
+      canonicalUrl,
+      title,
+      description,
+      product,
+      fetchedAt: new Date().toISOString(),
+      status: response.status,
+      ok: response.ok,
+      contentType,
+      wordCount,
+      headings,
+      paragraphs,
+      links,
+      images,
+      excerpt: truncateText(paragraphs[0] || plainText, 320),
+      counts: {
+        headings: headings.length,
+        paragraphs: paragraphs.length,
+        links: links.length,
+        images: images.length,
+      },
+    };
+
+    return createResult(200, {
+      message: `Scraped ${scrape.finalUrl} successfully.`,
+      scrape,
+    });
+  } catch (error) {
+    return createResult(502, {
+      error: "Web scraping failed.",
+      details: error.name === "AbortError" ? "The page took too long to respond." : error.message,
+    });
+  }
 }
 
 export async function getModelsResult() {
