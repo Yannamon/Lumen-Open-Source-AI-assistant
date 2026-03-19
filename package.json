@@ -4,10 +4,10 @@
   "description": "Local voice-enabled personal assistant powered by an LM Studio server.",
   "private": true,
   "scripts": {
-    "clean": "node -e \"require('fs').rmSync('.next',{ recursive: true, force: true })\"",
+    "clean": "node scripts/clean-next.js",
     "dev": "npm run clean && node scripts/dev-server.js",
-    "dev:next": "npm run clean && next dev",
-    "build": "node -e \"require('fs').rmSync('.next',{ recursive: true, force: true })\" && next build && node scripts/prepare-standalone.js",
+    "dev:next": "npm run clean && node scripts/dev-server.js",
+    "build": "node scripts/clean-next.js && next build && node scripts/prepare-standalone.js",
     "start": "next start",
     "prepare:standalone": "node scripts/prepare-standalone.js",
     "typecheck": "next typegen && tsc --noEmit",

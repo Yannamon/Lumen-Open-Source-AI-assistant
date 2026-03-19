@@ -8,7 +8,7 @@ A Next.js + TypeScript local voice-enabled assistant that runs in your browser a
 ## What it does
 
 - Serves a local Next.js web app at `http://localhost:3000`
-- Detects available chat models from your LM Studio server at `http://127.0.0.1:1234`
+- Detects available chat models from your LM Studio server at `http://yourip:1234`
 - Accepts typed prompts or microphone input in the browser
 - Speaks assistant replies aloud with browser text-to-speech
 - Lets you tune the assistant name, system prompt, model, temperature, and reply length
@@ -16,17 +16,18 @@ A Next.js + TypeScript local voice-enabled assistant that runs in your browser a
 
 ## Run it
 
-1. Make sure LM Studio's local server is running on `http://127.0.0.1:1234`
+1. Open LM Studio, go to `Developer`, and turn on the `Developer Server` so the local server is running on `http://yourip:1234`
 2. From this folder, run:
 
 ```powershell
 npm install
+npm run build
 npm run dev
 ```
 
 3. Open `http://localhost:3000` in Chrome or Edge
 
-`npm run dev` uses a small in-process launcher for Next.js dev mode so Windows setups that hit `spawn EPERM` can still start cleanly. If you want to try the stock Next CLI directly, use `npm run dev:next`.
+`npm run dev` uses a small in-process launcher for Next.js dev mode so Windows setups that hit `spawn EPERM` can still start cleanly. `npm run dev:next` now points to the same safe launcher so the Windows `spawn EPERM` path does not come back by accident.
 
 ## Production
 

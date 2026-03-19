@@ -20,7 +20,7 @@ const defaults = {
   transcriptionModel: "gpt-4o-mini-transcribe",
   transcriptionLanguage: "",
   useInternet: false,
-  assistantName: "Nova",
+  assistantName: "Lumen",
   systemPrompt:
     "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.",
   autoSpeak: true,
@@ -207,9 +207,15 @@ function parseScrapeRequest(prompt) {
 
 function readSettings() {
   try {
+    const savedSettings = JSON.parse(localStorage.getItem("assistant-settings")) || {};
+
+    if (savedSettings.assistantName === "Nova") {
+      savedSettings.assistantName = defaults.assistantName;
+    }
+
     return {
       ...defaults,
-      ...(JSON.parse(localStorage.getItem("assistant-settings")) || {}),
+      ...savedSettings,
     };
   } catch {
     return defaults;
