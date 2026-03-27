@@ -8,15 +8,18 @@
     "dev": "npm run clean && node scripts/dev-server.js",
     "dev:next": "npm run clean && node scripts/dev-server.js",
     "build": "node scripts/clean-next.js && next build && node scripts/prepare-standalone.js",
-    "start": "next start",
+    "start": "node scripts/start-server.js",
     "prepare:standalone": "node scripts/prepare-standalone.js",
-    "typecheck": "next typegen && tsc --noEmit",
+    "typecheck": "node scripts/typecheck.js",
     "legacy:start": "node server.js"
   },
   "dependencies": {
+    "@mastra/core": "^1.15.0",
+    "@mastra/libsql": "^1.7.1",
     "next": "^15.2.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",

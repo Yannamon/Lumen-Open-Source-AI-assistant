@@ -16,10 +16,11 @@ const defaults = {
   smtpHost: "smtp.example.com",
   smtpPort: 465,
   smtpUser: "",
-  transcriptionBaseUrl: "https://api.openai.com/v1",
-  transcriptionModel: "gpt-4o-mini-transcribe",
+  transcriptionBaseUrl: "http://127.0.0.1:8080/v1",
+  transcriptionModel: "whisper-1",
   transcriptionLanguage: "",
   useInternet: false,
+  agentMode: false,
   assistantName: "Lumen",
   systemPrompt:
     "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.",
@@ -29,6 +30,9 @@ const defaults = {
   maxTokens: 400,
   selectedSpeechModel: "",
   screenCaptureSurface: "any",
+  panelHidden: false,
+  pendingAgentApproval: null,
+  agentActionQueue: [],
 };
 
 const SCREEN_TRANSCRIPT_CHUNK_MS = 20000;
@@ -56,9 +60,14 @@ const state = {
   screenTranscriptPendingUploads: 0,
   screenTranscriptChunkCount: 0,
   screenTranscriptUploadChain: Promise.resolve(),
+  agentActionQueue: [],
+  pendingAgentApproval: null,
 };
 
 const elements = {
+  pageShell: document.querySelector(".page-shell"),
+  controlPanel: document.querySelector("#control-panel"),
+  toggleControlPanel: document.querySelector("#toggle-control-panel"),
   assistantName: document.querySelector("#assistant-name"),
   modelSelect: document.querySelector("#model-select"),
   voiceSelect: document.querySelector("#voice-select"),
@@ -66,6 +75,7 @@ const elements = {
   systemPrompt: document.querySelector("#system-prompt"),
   autoSpeak: document.querySelector("#auto-speak"),
   useInternet: document.querySelector("#use-internet"),
+  agentMode: document.querySelector("#agent-mode"),
   handsFree: document.querySelector("#hands-free"),
   temperature: document.querySelector("#temperature"),
   temperatureValue: document.querySelector("#temperature-value"),
@@ -131,6 +141,10 @@ const elements = {
   screenCaptureSurface: document.querySelector("#screen-capture-surface"),
   screenTranscript: document.querySelector("#screen-transcript"),
   screenTranscriptStatus: document.querySelector("#screen-transcript-status"),
+  agentActionQueue: document.querySelector("#agent-action-queue"),
+  agentQueueStatus: document.querySelector("#agent-queue-status"),
+  runApprovedAgentActions: document.querySelector("#run-approved-agent-actions"),
+  clearAgentQueue: document.querySelector("#clear-agent-queue"),
   template: document.querySelector("#message-template"),
   shortcutTiles: document.querySelectorAll(".shortcut-tile"),
 };
@@ -241,6 +255,7 @@ function saveSettings() {
         elements.transcriptionModel.value.trim() || defaults.transcriptionModel,
       transcriptionLanguage: elements.transcriptionLanguage.value.trim(),
       useInternet: elements.useInternet.checked,
+      agentMode: elements.agentMode.checked,
       systemPrompt: elements.systemPrompt.value.trim() || defaults.systemPrompt,
       autoSpeak: elements.autoSpeak.checked,
       handsFree: elements.handsFree.checked,
@@ -250,8 +265,27 @@ function saveSettings() {
       selectedModel: elements.modelSelect.value,
       selectedSpeechModel: elements.speechModelSelect.value,
       screenCaptureSurface: elements.screenCaptureSurface.value,
+      panelHidden: elements.pageShell.classList.contains("is-panel-hidden"),
+      pendingAgentApproval: state.pendingAgentApproval,
+      agentActionQueue: state.agentActionQueue,
     })
   );
+}
+
+function updateControlPanelVisibility(panelHidden) {
+  elements.pageShell.classList.toggle("is-panel-hidden", panelHidden);
+  elements.controlPanel.setAttribute("aria-hidden", String(panelHidden));
+  elements.toggleControlPanel.textContent = panelHidden ? "Show panel" : "Hide panel";
+  elements.toggleControlPanel.setAttribute("aria-expanded", String(!panelHidden));
+  elements.toggleControlPanel.setAttribute(
+    "aria-label",
+    panelHidden ? "Show side panel" : "Hide side panel"
+  );
+}
+
+function toggleControlPanelVisibility() {
+  updateControlPanelVisibility(!elements.pageShell.classList.contains("is-panel-hidden"));
+  saveSettings();
 }
 
 const VISUAL_STOP_WORDS = new Set([
@@ -904,7 +938,7 @@ async function performScrapeRequest(request) {
   return payload.scrape;
 }
 
-function renderMessage(role, content, sources = []) {
+function renderMessage(role, content, sources = [], reasoningTrace = []) {
   const fragment = elements.template.content.cloneNode(true);
   const article = fragment.querySelector(".message");
   const roleLabel = fragment.querySelector(".message-role");
@@ -938,23 +972,299 @@ function renderMessage(role, content, sources = []) {
     sourcesNode.appendChild(list);
   }
 
+  if (role === "assistant" && reasoningTrace.length) {
+    const traceNode = document.createElement("details");
+    traceNode.className = "message-trace";
+    traceNode.open = true;
+
+    const summary = document.createElement("summary");
+    summary.className = "message-trace-summary";
+    summary.textContent = "Agent trace";
+    traceNode.appendChild(summary);
+
+    const list = document.createElement("div");
+    list.className = "message-trace-list";
+
+    reasoningTrace.forEach((entry) => {
+      const item = document.createElement("div");
+      item.className = `message-trace-item is-${entry.status === "error" ? "error" : "ok"}`;
+
+      const step = document.createElement("span");
+      step.className = "message-trace-step";
+      step.textContent = `Step ${entry.step}`;
+
+      const title = document.createElement("strong");
+      title.className = "message-trace-title";
+      title.textContent = entry.title || "Agent action";
+
+      const detail = document.createElement("p");
+      detail.className = "message-trace-detail";
+      detail.textContent = entry.detail || "Completed an action.";
+
+      item.append(step, title, detail);
+      list.appendChild(item);
+    });
+
+    traceNode.appendChild(list);
+    article.appendChild(traceNode);
+  }
+
   elements.chatLog.appendChild(fragment);
   elements.chatLog.scrollTop = elements.chatLog.scrollHeight;
+}
+
+function hasPendingAgentApprovals() {
+  return Boolean(
+    state.pendingAgentApproval?.runId &&
+      state.agentActionQueue.some((item) => item.status === "pending_approval")
+  );
+}
+
+function syncAgentQueueButtons() {
+  elements.runApprovedAgentActions.disabled = !hasPendingAgentApprovals();
+}
+
+function renderAgentActionQueue() {
+  elements.agentActionQueue.innerHTML = "";
+
+  if (!state.agentActionQueue.length) {
+    elements.agentQueueStatus.textContent =
+      "Agent mode will show queued actions and approvals here.";
+    syncAgentQueueButtons();
+    return;
+  }
+
+  const pendingCount = state.agentActionQueue.filter(
+    (item) => item.status === "pending_approval"
+  ).length;
+  elements.agentQueueStatus.textContent = pendingCount
+    ? `Review ${pendingCount} queued action${pendingCount === 1 ? "" : "s"} before the workflow resumes.`
+    : "Latest queued agent actions.";
+
+  state.agentActionQueue.forEach((item) => {
+    const article = document.createElement("article");
+    article.className = "agent-queue-item";
+    article.dataset.tier = item.safetyTier;
+
+    const meta = document.createElement("div");
+    meta.className = "agent-queue-meta";
+
+    const owner = document.createElement("span");
+    owner.className = "agent-queue-pill";
+    owner.textContent = item.owner === "research-agent" ? "Research" : "Operations";
+
+    const tier = document.createElement("span");
+    tier.className = "agent-queue-pill";
+    tier.textContent = item.safetyTier;
+
+    const status = document.createElement("span");
+    status.className = "agent-queue-pill";
+    status.textContent = item.status.replace(/_/g, " ");
+
+    meta.append(owner, tier, status);
+
+    const title = document.createElement("p");
+    title.className = "agent-queue-title";
+    title.textContent = item.title || "Queued action";
+
+    const description = document.createElement("p");
+    description.className = "agent-queue-description";
+    description.textContent = item.description || item.request || "No description.";
+
+    article.append(meta, title, description);
+
+    if (item.status === "pending_approval") {
+      const decisionRow = document.createElement("div");
+      decisionRow.className = "agent-queue-decision";
+
+      const approveButton = document.createElement("button");
+      approveButton.type = "button";
+      approveButton.className = "ghost-button";
+      approveButton.textContent = "Approve";
+      const selectedDecision = item.reviewDecision || "approve";
+      if (selectedDecision === "approve") {
+        approveButton.classList.add("is-selected");
+      }
+      approveButton.addEventListener("click", () => {
+        item.reviewDecision = "approve";
+        renderAgentActionQueue();
+        saveSettings();
+      });
+
+      const rejectButton = document.createElement("button");
+      rejectButton.type = "button";
+      rejectButton.className = "ghost-button";
+      rejectButton.textContent = "Reject";
+      if (selectedDecision === "reject") {
+        rejectButton.classList.add("is-selected");
+      }
+      rejectButton.addEventListener("click", () => {
+        item.reviewDecision = "reject";
+        renderAgentActionQueue();
+        saveSettings();
+      });
+
+      decisionRow.append(approveButton, rejectButton);
+      article.appendChild(decisionRow);
+
+      if (item.canEdit) {
+        const editWrap = document.createElement("div");
+        editWrap.className = "agent-queue-edit";
+
+        const label = document.createElement("label");
+        label.textContent = "Edited args JSON";
+
+        const textarea = document.createElement("textarea");
+        textarea.value = JSON.stringify(item.reviewEditedArgs || item.args || {}, null, 2);
+        textarea.addEventListener("input", () => {
+          item.reviewEditedArgsText = textarea.value;
+          try {
+            item.reviewEditedArgs = JSON.parse(textarea.value);
+            textarea.style.borderColor = "";
+          } catch {
+            textarea.style.borderColor = "rgba(251, 146, 177, 0.5)";
+          }
+          saveSettings();
+        });
+
+        editWrap.append(label, textarea);
+        article.appendChild(editWrap);
+      }
+    }
+
+    if (item.result || item.error) {
+      const result = document.createElement("p");
+      result.className = `agent-queue-result${item.error ? " is-error" : ""}`;
+      result.textContent = item.error || item.result;
+      article.appendChild(result);
+    }
+
+    elements.agentActionQueue.appendChild(article);
+  });
+
+  syncAgentQueueButtons();
+}
+
+function normalizeAgentActionQueue(queue) {
+  return (Array.isArray(queue) ? queue : []).map((item) => ({
+    ...item,
+    reviewDecision: item.reviewDecision || "approve",
+    reviewEditedArgs:
+      item.reviewEditedArgs && typeof item.reviewEditedArgs === "object"
+        ? item.reviewEditedArgs
+        : item.args || {},
+    reviewEditedArgsText:
+      typeof item.reviewEditedArgsText === "string"
+        ? item.reviewEditedArgsText
+        : JSON.stringify(item.args || {}, null, 2),
+  }));
+}
+
+function applyAgentWorkflowPayload(payload) {
+  state.agentActionQueue = normalizeAgentActionQueue(payload.actionQueue);
+  state.pendingAgentApproval =
+    payload.pendingApproval && typeof payload.pendingApproval === "object"
+      ? payload.pendingApproval
+      : null;
+  renderAgentActionQueue();
+}
+
+function clearAgentActionQueue() {
+  state.agentActionQueue = [];
+  state.pendingAgentApproval = null;
+  renderAgentActionQueue();
+  saveSettings();
+}
+
+async function resumeApprovedAgentActions() {
+  if (!state.pendingAgentApproval?.runId) {
+    return;
+  }
+
+  const decisions = state.agentActionQueue
+    .filter((item) => item.status === "pending_approval")
+    .map((item) => {
+      let editedArgs = undefined;
+
+      if (item.canEdit) {
+        try {
+          editedArgs = JSON.parse(item.reviewEditedArgsText || "{}");
+        } catch {
+          throw new Error(`Edited args for "${item.title}" are not valid JSON.`);
+        }
+      }
+
+      return {
+        id: item.id,
+        decision: item.reviewDecision === "reject" ? "reject" : "approve",
+        editedArgs,
+      };
+    });
+
+  setHelperText(elements.agentQueueStatus, "Resuming agent workflow...");
+
+  const response = await fetch("/api/agent-approval", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      runId: state.pendingAgentApproval.runId,
+      decisions,
+    }),
+  });
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new Error(payload.details || payload.error || "Could not resume the agent workflow.");
+  }
+
+  applyAgentWorkflowPayload(payload);
+
+  const assistantReply = String(payload.message || "").trim();
+  if (assistantReply) {
+    state.messages.push({
+      role: "assistant",
+      content: assistantReply,
+      sources: Array.isArray(payload.sources) ? payload.sources : [],
+      reasoningTrace: Array.isArray(payload.reasoningTrace) ? payload.reasoningTrace : [],
+    });
+    rerenderChat();
+    elements.liveTranscript.textContent = "Reply ready.";
+    void speakText(assistantReply);
+  }
+
+  saveSettings();
 }
 
 function rerenderChat() {
   elements.chatLog.innerHTML = "";
 
   if (!state.messages.length) {
-    renderMessage(
-      "assistant",
-      `${elements.assistantName.value || defaults.assistantName} is online. Submit a request by voice or text to begin the session.`
-    );
+    const emptyState = document.createElement("div");
+    emptyState.className = "chat-log-empty";
+
+    const title = document.createElement("strong");
+    title.className = "chat-log-empty-title";
+    title.textContent = `${elements.assistantName.value || defaults.assistantName} is online`;
+
+    const detail = document.createElement("p");
+    detail.className = "chat-log-empty-detail";
+    detail.textContent =
+      "Start voice input, choose a quick action, or type a message to begin the session.";
+
+    emptyState.append(title, detail);
+    elements.chatLog.appendChild(emptyState);
     return;
   }
 
   state.messages.forEach((message) =>
-    renderMessage(message.role, message.content, message.sources || [])
+    renderMessage(
+      message.role,
+      message.content,
+      message.sources || [],
+      message.reasoningTrace || []
+    )
   );
 }
 
@@ -1552,14 +1862,14 @@ async function loadEndpointConfig() {
       payload.transcription?.enabled
         ? `Ready with ${payload.transcription.model}`
         : payload.transcription?.baseUrl
-          ? "Base URL saved, API key missing"
+          ? "Base URL saved, model missing"
           : "Not configured",
       !payload.transcription?.enabled
     );
     elements.homeAssistantNote.textContent =
       "The token is write-only here. Leave it blank to keep the current saved token.";
     elements.transcriptionNote.textContent =
-      "The API key is write-only here. Leave it blank to keep the current saved key.";
+      "The API key is optional for LocalAI-compatible servers. Leave it blank to keep the current saved value.";
     saveSettings();
   } catch (error) {
     const settings = readSettings();
@@ -1752,16 +2062,16 @@ async function saveTranscriptionConfig() {
       elements.transcriptionStatus,
       payload.transcription?.enabled
         ? `Ready with ${payload.transcription.model}`
-        : "Saved, but API key is still missing.",
+        : "Saved, but the transcription model is still missing.",
       !payload.transcription?.enabled
     );
     elements.transcriptionNote.textContent =
-      "The API key is write-only here. Leave it blank to keep the current saved key.";
+      "The API key is optional for LocalAI-compatible servers. Leave it blank to keep the current saved value.";
     saveSettings();
   } catch (error) {
     setStatus(elements.transcriptionStatus, error.message, true);
     elements.transcriptionNote.textContent =
-      "Check the transcription API base URL, model, language hint, and API key, then save again.";
+      "Check the LocalAI base URL, model, and language hint, then save again.";
   }
 }
 
@@ -2165,6 +2475,8 @@ async function sendCurrentMessage() {
   elements.messageInput.value = "";
   elements.liveTranscript.textContent = scrapeRequest
     ? "Scraping the page and preparing JSON..."
+    : elements.agentMode.checked
+      ? "Agent mode is planning and acting..."
     : visualExamples
       ? "Thinking and preparing visual examples..."
       : "Thinking...";
@@ -2192,6 +2504,7 @@ async function sendCurrentMessage() {
         model: elements.modelSelect.value,
         messages: buildMessages(),
         useInternet: elements.useInternet.checked,
+        agentMode: elements.agentMode.checked,
         temperature: Number(elements.temperature.value),
         maxTokens: Number(elements.maxTokens.value),
       }),
@@ -2204,10 +2517,12 @@ async function sendCurrentMessage() {
     }
 
     const assistantReply = payload.message.trim();
+    applyAgentWorkflowPayload(payload);
     state.messages.push({
       role: "assistant",
       content: assistantReply,
       sources: Array.isArray(payload.sources) ? payload.sources : [],
+      reasoningTrace: Array.isArray(payload.reasoningTrace) ? payload.reasoningTrace : [],
     });
     rerenderChat();
     elements.liveTranscript.textContent = "Reply ready.";
@@ -2237,6 +2552,7 @@ async function sendCurrentMessage() {
 }
 
 function attachEvents() {
+  elements.toggleControlPanel.addEventListener("click", toggleControlPanelVisibility);
   elements.refreshModels.addEventListener("click", () => {
     loadModels().catch(() => {});
   });
@@ -2268,6 +2584,12 @@ function attachEvents() {
     elements.messageInput.focus();
   });
   elements.screenTranscript.addEventListener("input", syncScreenTranscriptButtons);
+  elements.runApprovedAgentActions.addEventListener("click", () => {
+    resumeApprovedAgentActions().catch((error) => {
+      setHelperText(elements.agentQueueStatus, error.message, true);
+    });
+  });
+  elements.clearAgentQueue.addEventListener("click", clearAgentActionQueue);
 
   elements.shortcutTiles.forEach((button) => {
     button.addEventListener("click", () => {
@@ -2287,6 +2609,7 @@ function attachEvents() {
     elements.systemPrompt,
     elements.autoSpeak,
     elements.useInternet,
+    elements.agentMode,
     elements.handsFree,
     elements.modelSelect,
     elements.endpointInput,
@@ -2382,14 +2705,19 @@ function applySettings() {
   elements.systemPrompt.value = settings.systemPrompt;
   elements.autoSpeak.checked = settings.autoSpeak;
   elements.useInternet.checked = settings.useInternet;
+  elements.agentMode.checked = settings.agentMode;
   elements.handsFree.checked = settings.handsFree;
   elements.temperature.value = String(settings.temperature);
   elements.maxTokens.value = String(settings.maxTokens);
+  state.pendingAgentApproval = settings.pendingAgentApproval || null;
+  state.agentActionQueue = normalizeAgentActionQueue(settings.agentActionQueue);
+  updateControlPanelVisibility(Boolean(settings.panelHidden));
   updateRangeLabels();
   updateHeroTitle();
   clearScreenPreview();
   syncScreenTranscriptButtons();
   hideVisualExamples();
+  renderAgentActionQueue();
 }
 
 async function initialize() {

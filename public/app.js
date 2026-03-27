@@ -6,6 +6,7 @@ const defaults = {
   smtpPort: 465,
   smtpUser: "",
   useInternet: false,
+  agentMode: false,
   assistantName: "Nova",
   systemPrompt:
     "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.",
@@ -38,6 +39,7 @@ const elements = {
   systemPrompt: document.querySelector("#system-prompt"),
   autoSpeak: document.querySelector("#auto-speak"),
   useInternet: document.querySelector("#use-internet"),
+  agentMode: document.querySelector("#agent-mode"),
   handsFree: document.querySelector("#hands-free"),
   temperature: document.querySelector("#temperature"),
   temperatureValue: document.querySelector("#temperature-value"),
@@ -108,6 +110,7 @@ function saveSettings() {
       smtpPort: Number(elements.smtpPort.value) || defaults.smtpPort,
       smtpUser: elements.smtpUser.value.trim() || defaults.smtpUser,
       useInternet: elements.useInternet.checked,
+      agentMode: elements.agentMode.checked,
       systemPrompt: elements.systemPrompt.value.trim() || defaults.systemPrompt,
       autoSpeak: elements.autoSpeak.checked,
       handsFree: elements.handsFree.checked,
@@ -120,7 +123,7 @@ function saveSettings() {
   );
 }
 
-function renderMessage(role, content, sources = []) {
+function renderMessage(role, content, sources = [], reasoningTrace = []) {
   const fragment = elements.template.content.cloneNode(true);
   const article = fragment.querySelector(".message");
   const roleLabel = fragment.querySelector(".message-role");
@@ -154,6 +157,43 @@ function renderMessage(role, content, sources = []) {
     sourcesNode.appendChild(list);
   }
 
+  if (role === "assistant" && reasoningTrace.length) {
+    const traceNode = document.createElement("details");
+    traceNode.className = "message-trace";
+    traceNode.open = true;
+
+    const summary = document.createElement("summary");
+    summary.className = "message-trace-summary";
+    summary.textContent = "Agent trace";
+    traceNode.appendChild(summary);
+
+    const list = document.createElement("div");
+    list.className = "message-trace-list";
+
+    reasoningTrace.forEach((entry) => {
+      const item = document.createElement("div");
+      item.className = `message-trace-item is-${entry.status === "error" ? "error" : "ok"}`;
+
+      const step = document.createElement("span");
+      step.className = "message-trace-step";
+      step.textContent = `Step ${entry.step}`;
+
+      const title = document.createElement("strong");
+      title.className = "message-trace-title";
+      title.textContent = entry.title || "Agent action";
+
+      const detail = document.createElement("p");
+      detail.className = "message-trace-detail";
+      detail.textContent = entry.detail || "Completed an action.";
+
+      item.append(step, title, detail);
+      list.appendChild(item);
+    });
+
+    traceNode.appendChild(list);
+    article.appendChild(traceNode);
+  }
+
   elements.chatLog.appendChild(fragment);
   elements.chatLog.scrollTop = elements.chatLog.scrollHeight;
 }
@@ -170,7 +210,12 @@ function rerenderChat() {
   }
 
   state.messages.forEach((message) =>
-    renderMessage(message.role, message.content, message.sources || [])
+    renderMessage(
+      message.role,
+      message.content,
+      message.sources || [],
+      message.reasoningTrace || []
+    )
   );
 }
 
@@ -812,6 +857,9 @@ async function sendCurrentMessage() {
   rerenderChat();
   elements.messageInput.value = "";
   elements.liveTranscript.textContent = "Thinking...";
+  if (elements.agentMode.checked) {
+    elements.liveTranscript.textContent = "Agent mode is planning and acting...";
+  }
 
   try {
     const response = await fetch("/api/chat", {
@@ -823,6 +871,7 @@ async function sendCurrentMessage() {
         model: elements.modelSelect.value,
         messages: buildMessages(),
         useInternet: elements.useInternet.checked,
+        agentMode: elements.agentMode.checked,
         temperature: Number(elements.temperature.value),
         maxTokens: Number(elements.maxTokens.value),
       }),
@@ -839,6 +888,7 @@ async function sendCurrentMessage() {
       role: "assistant",
       content: assistantReply,
       sources: Array.isArray(payload.sources) ? payload.sources : [],
+      reasoningTrace: Array.isArray(payload.reasoningTrace) ? payload.reasoningTrace : [],
     });
     rerenderChat();
     elements.liveTranscript.textContent = "Reply ready.";
@@ -889,6 +939,7 @@ function attachEvents() {
     elements.systemPrompt,
     elements.autoSpeak,
     elements.useInternet,
+    elements.agentMode,
     elements.handsFree,
     elements.modelSelect,
     elements.endpointInput,
@@ -954,6 +1005,7 @@ function applySettings() {
   elements.systemPrompt.value = settings.systemPrompt;
   elements.autoSpeak.checked = settings.autoSpeak;
   elements.useInternet.checked = settings.useInternet;
+  elements.agentMode.checked = settings.agentMode;
   elements.handsFree.checked = settings.handsFree;
   elements.temperature.value = String(settings.temperature);
   elements.maxTokens.value = String(settings.maxTokens);

@@ -23,6 +23,8 @@ const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/";
 const DEFAULT_SPEECH_MODEL = "tts2-emo-qwen3-8b-192k";
 const SPOTIFY_WEB_URL = "https://open.spotify.com/";
+const AGENT_LOOP_LIMIT = 4;
+const AGENT_TOOL_CALL_LIMIT = 4;
 const PUBLIC_DIR = path.join(__dirname, "public");
 const ASSISTANT_GUARDRAIL = {
   role: "system",
@@ -64,6 +66,111 @@ function buildInternetGroundingMessage(query, sources) {
   };
 }
 
+function buildAgentModeMessage(useInternet) {
+  return {
+    role: "system",
+    content:
+      "Agent mode is enabled. You may use available tools to gather information or take safe local actions before answering. " +
+      "Use tools instead of guessing when the task needs the current date or time, internet research, email, or local computer control. " +
+      "Only take actions that directly help with the user's request. Do not run arbitrary shell commands, automate external prompt windows, or take destructive actions. " +
+      `${useInternet ? "Internet search is available for this request. " : "Internet search is not enabled for this request. "}` +
+      "You may make multiple tool calls, then provide one concise final answer.",
+  };
+}
+
+function buildAgentToolDefinitions(useInternet) {
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "get_current_datetime",
+        description: "Get the current local date and time from the computer.",
+        parameters: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "computer_control_request",
+        description:
+          "Perform a safe local computer action like opening an app, controlling Spotify playback, opening VS Code, or reading system info. Do not use this for arbitrary shell commands.",
+        parameters: {
+          type: "object",
+          properties: {
+            request: {
+              type: "string",
+              description:
+                "A natural-language request such as 'open VS Code', 'pause Spotify', or 'show system info'.",
+            },
+          },
+          required: ["request"],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "send_email",
+        description:
+          "Send an email through configured SMTP or open a local email draft.",
+        parameters: {
+          type: "object",
+          properties: {
+            intent: {
+              type: "string",
+              enum: ["send", "draft"],
+              description: "Use 'send' to send immediately or 'draft' to open a local draft.",
+            },
+            to: {
+              type: "string",
+              description: "One or more email addresses separated by commas.",
+            },
+            subject: {
+              type: "string",
+              description: "The email subject line.",
+            },
+            body: {
+              type: "string",
+              description: "The plain-text email body.",
+            },
+          },
+          required: ["intent", "to"],
+          additionalProperties: false,
+        },
+      },
+    },
+  ];
+
+  if (useInternet) {
+    tools.unshift({
+      type: "function",
+      function: {
+        name: "search_internet",
+        description:
+          "Search the web for grounded information and return source snippets and links.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query to look up on the internet.",
+            },
+          },
+          required: ["query"],
+          additionalProperties: false,
+        },
+      },
+    });
+  }
+
+  return tools;
+}
+
 function buildSpeechPolishMessages(text) {
   return [
     {
@@ -78,6 +185,27 @@ function buildSpeechPolishMessages(text) {
       content:
         "Make this sound natural when read aloud, but keep the meaning the same:\n\n" +
         text,
+    },
+  ];
+}
+
+function buildGrammarCheckMessages(text) {
+  return [
+    {
+      role: "system",
+      content:
+        "You are a careful grammar and clarity editor. Correct grammar, spelling, punctuation, and awkward phrasing while preserving the original meaning and tone. " +
+        "Return plain text using this format exactly:\n" +
+        "Corrected text:\n" +
+        "<improved text>\n\n" +
+        "Key improvements:\n" +
+        "- <brief improvement>\n" +
+        "- <brief improvement>\n" +
+        "If the text is already strong, still provide the corrected text and say that only minor or no changes were needed.",
+    },
+    {
+      role: "user",
+      content: `Check and improve this writing:\n\n${text}`,
     },
   ];
 }
@@ -165,6 +293,24 @@ function parseEmailRequest(message) {
   const body = bodyMatch?.[1]?.trim() || "";
 
   return { intent, to, subject, body };
+}
+
+function parseGrammarCheckRequest(message) {
+  if (typeof message !== "string") {
+    return null;
+  }
+
+  const trimmed = message.trim();
+  const match = trimmed.match(
+    /^(?:grammar check|check grammar|proofread|proofread this|fix grammar|correct grammar|improve grammar|edit grammar|polish writing)\s*[:\-]?\s+([\s\S]+)$/i
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const text = match[1]?.trim();
+  return text ? { text } : null;
 }
 
 function buildMailtoUrl({ to, subject, body }) {
@@ -256,6 +402,134 @@ function stripReasoningBlocks(value) {
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(/<think>[\s\S]*$/gi, "")
     .trim();
+}
+
+function parseJsonObject(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    throw new Error("Tool arguments were not valid JSON.");
+  }
+}
+
+function parseJsonObjectSafe(value) {
+  try {
+    return parseJsonObject(value);
+  } catch {
+    return {};
+  }
+}
+
+function clipAgentTraceText(value, maxLength = 220) {
+  const text = typeof value === "string" ? normalizeWhitespace(value) : "";
+
+  if (!text) {
+    return "";
+  }
+
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3).trim()}...` : text;
+}
+
+function getAgentTraceTitle(toolName) {
+  switch (toolName) {
+    case "get_current_datetime":
+      return "Checked local date and time";
+    case "search_internet":
+      return "Searched the web";
+    case "computer_control_request":
+      return "Used local computer control";
+    case "home_assistant_request":
+      return "Queried Home Assistant";
+    case "send_email":
+      return "Prepared email action";
+    default:
+      return "Used an agent tool";
+  }
+}
+
+function buildAgentTraceDetail(toolName, args, payload) {
+  if (payload?.ok === false) {
+    return payload.error || "The tool call did not complete successfully.";
+  }
+
+  switch (toolName) {
+    case "get_current_datetime":
+      return payload?.dateTime
+        ? `Checked the local clock: ${payload.dateTime} (${payload.timeZone || "local time"}).`
+        : "Checked the local computer clock.";
+    case "search_internet": {
+      const resultCount = Array.isArray(payload?.results) ? payload.results.length : 0;
+      const query = payload?.query || args?.query || "";
+      return query
+        ? `Looked up "${query}" and gathered ${resultCount} grounded source${resultCount === 1 ? "" : "s"}.`
+        : `Gathered ${resultCount} grounded source${resultCount === 1 ? "" : "s"} from the web.`;
+    }
+    case "computer_control_request":
+      return payload?.result || payload?.request || args?.request || "Completed a local computer action.";
+    case "home_assistant_request":
+      return payload?.result || payload?.request || args?.request || "Completed a Home Assistant action.";
+    case "send_email":
+      return payload?.result
+        || (payload?.to ? `Prepared an email action for ${payload.to}.` : "")
+        || (args?.to ? `Prepared an email action for ${args.to}.` : "Prepared an email action.");
+    default:
+      return payload?.result || payload?.message || "Completed a tool action.";
+  }
+}
+
+function buildAgentTraceEntry(stepNumber, toolCall, result) {
+  const toolName = toolCall?.function?.name || "";
+  const args = parseJsonObjectSafe(toolCall?.function?.arguments || "{}");
+  const payload = parseJsonObjectSafe(result?.content || "{}");
+
+  return {
+    step: stepNumber,
+    title: getAgentTraceTitle(toolName),
+    detail: clipAgentTraceText(buildAgentTraceDetail(toolName, args, payload)),
+    status: payload?.ok === false ? "error" : "ok",
+  };
+}
+
+function getMessageTextContent(message) {
+  if (typeof message?.content === "string") {
+    return message.content;
+  }
+
+  if (Array.isArray(message?.content)) {
+    return message.content
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+
+        return typeof part?.text === "string" ? part.text : "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  return "";
+}
+
+function mergeSearchSources(existing, incoming) {
+  const merged = new Map();
+
+  for (const source of [...existing, ...incoming]) {
+    const key = source?.url || source?.title;
+    if (!key || merged.has(key)) {
+      continue;
+    }
+
+    merged.set(key, source);
+  }
+
+  return [...merged.values()];
 }
 
 function extractDuckDuckGoResultUrl(rawHref) {
@@ -425,6 +699,112 @@ if (Get-Command chrome.exe -ErrorAction SilentlyContinue) {
 `;
 
   await runPowerShell(command);
+}
+
+async function focusWindowByPattern(patterns) {
+  const searchPatterns = Array.isArray(patterns) ? patterns : [patterns];
+  const encodedPatterns = searchPatterns
+    .filter(Boolean)
+    .map((pattern) => `'${escapePowerShellString(pattern)}'`)
+    .join(", ");
+  const command = `
+Add-Type -AssemblyName System.Windows.Forms;
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class ForegroundWindow {
+  [DllImport("user32.dll")]
+  public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+  [DllImport("user32.dll")]
+  public static extern bool BringWindowToTop(IntPtr hWnd);
+}
+"@;
+$patterns = @(${encodedPatterns});
+$targetWindow = Get-Process |
+  Where-Object { $_.MainWindowHandle -and $_.MainWindowTitle } |
+  Where-Object {
+    $title = $_.MainWindowTitle;
+    foreach ($pattern in $patterns) {
+      if ($title -like "*$pattern*") {
+        return $true
+      }
+    }
+    return $false
+  } |
+  Select-Object -First 1;
+if (-not $targetWindow) {
+  throw 'Could not find the target window.'
+}
+$wshShell = New-Object -ComObject WScript.Shell;
+$null = [System.Windows.Forms.SendKeys]::SendWait('%');
+Start-Sleep -Milliseconds 120;
+$null = [ForegroundWindow]::ShowWindowAsync($targetWindow.MainWindowHandle, 9);
+$null = [ForegroundWindow]::BringWindowToTop($targetWindow.MainWindowHandle);
+$null = [ForegroundWindow]::SetForegroundWindow($targetWindow.MainWindowHandle);
+try {
+  $null = $wshShell.AppActivate([int]$targetWindow.Id);
+} catch {
+}
+Start-Sleep -Milliseconds 180;
+Write-Output $targetWindow.MainWindowTitle
+`;
+
+  const { stdout } = await runPowerShell(command);
+  return stdout.trim();
+}
+
+async function sendKeysToFocusedWindow(keys) {
+  const safeKeys = escapePowerShellString(keys);
+  const command = `
+Add-Type -AssemblyName System.Windows.Forms;
+Start-Sleep -Milliseconds 120;
+[System.Windows.Forms.SendKeys]::SendWait('${safeKeys}');
+`;
+
+  await runPowerShell(command);
+}
+
+async function controlSpotifyWebPlayback(commandName) {
+  await openWebApp(SPOTIFY_WEB_URL);
+
+  const spotifyWindowPatterns = ["Spotify", "Open Spotify", "spotify"];
+  const waitSchedule =
+    commandName === "play" ? [2200, 1600, 2200] : [700, 900];
+
+  for (const waitMs of waitSchedule) {
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+    try {
+      await focusWindowByPattern(spotifyWindowPatterns);
+    } catch {
+    }
+
+    if (commandName === "play" || commandName === "pause") {
+      await sendMediaKey("0xB3");
+      if (commandName === "play") {
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        try {
+          await sendKeysToFocusedWindow(" ");
+        } catch {
+        }
+      }
+      continue;
+    }
+
+    if (commandName === "next") {
+      await sendMediaKey("0xB0");
+      return;
+    }
+
+    if (commandName === "previous") {
+      await sendMediaKey("0xB1");
+      return;
+    }
+  }
 }
 
 function escapePowerShellString(value) {
@@ -909,15 +1289,15 @@ function parseComputerControlRequest(message) {
   }
 
   if (/pause\s+(?:music|spotify)|pause spotify/.test(normalized)) {
-    return { type: "spotify_pause" };
+    return { type: "spotify_pause", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
   }
 
   if (/next\s+(?:song|track)|skip\s+(?:song|track)|spotify next/.test(normalized)) {
-    return { type: "media_next" };
+    return { type: "media_next", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
   }
 
   if (/previous\s+(?:song|track)|back\s+(?:song|track)|spotify previous/.test(normalized)) {
-    return { type: "media_previous" };
+    return { type: "media_previous", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
   }
 
   if (/^(open|launch|start)\s+notepad\b/.test(normalized)) {
@@ -1000,21 +1380,33 @@ async function executeComputerControl(action) {
         : "I opened VS Code.";
     }
     case "spotify_play":
+      if (action.target === "spotify_web") {
+        await controlSpotifyWebPlayback("play");
+        return "I opened Spotify Web, focused the player window, and retried the play command.";
+      }
       await openWindowsApp(action.target || "spotify");
-      await new Promise((resolve) =>
-        setTimeout(resolve, action.target === "spotify_web" ? 2200 : 1200)
-      );
+      await new Promise((resolve) => setTimeout(resolve, 1200));
       await sendMediaKey("0xB3");
-      return action.target === "spotify_web"
-        ? "I opened Spotify Web and sent the play command."
-        : "I opened Spotify and sent the play command.";
+      return "I opened Spotify and sent the play command.";
     case "spotify_pause":
+      if (action.target === "spotify_web") {
+        await controlSpotifyWebPlayback("pause");
+        return "I focused Spotify Web and sent the pause command.";
+      }
       await sendMediaKey("0xB3");
       return "I sent the Spotify play or pause media command.";
     case "media_next":
+      if (action.target === "spotify_web") {
+        await controlSpotifyWebPlayback("next");
+        return "I focused Spotify Web and skipped to the next track.";
+      }
       await sendMediaKey("0xB0");
       return "I skipped to the next track.";
     case "media_previous":
+      if (action.target === "spotify_web") {
+        await controlSpotifyWebPlayback("previous");
+        return "I focused Spotify Web and went back to the previous track.";
+      }
       await sendMediaKey("0xB1");
       return "I went back to the previous track.";
     case "run_command":
@@ -1400,29 +1792,109 @@ function scoreChatModel(modelId) {
 }
 
 async function fetchLmStudio(pathname, options = {}) {
-  const response = await fetch(`${lmStudioBaseUrl}${pathname}`, {
+  const url = `${lmStudioBaseUrl}${pathname}`;
+  const requestOptions = {
     ...options,
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
-  });
+  };
+  let lastError = null;
 
-  const contentType = response.headers.get("content-type") || "";
-  const payload = contentType.includes("application/json")
-    ? await response.json()
-    : await response.text();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(url, requestOptions);
 
-  if (!response.ok) {
-    const errorMessage =
-      typeof payload === "string"
-        ? payload
-        : payload?.error?.message || "LM Studio request failed.";
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json")
+        ? await response.json()
+        : await response.text();
 
-    throw new Error(errorMessage);
+      if (!response.ok) {
+        const errorMessage =
+          typeof payload === "string"
+            ? payload
+            : payload?.error?.message || "LM Studio request failed.";
+
+        throw new Error(errorMessage);
+      }
+
+      return payload;
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === 0 && shouldRetryLmStudioFetch(error)) {
+        await delay(250);
+        continue;
+      }
+
+      throw new Error(formatLmStudioFetchError(url, error));
+    }
   }
 
-  return payload;
+  throw new Error(formatLmStudioFetchError(url, lastError));
+}
+
+function shouldRetryLmStudioFetch(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("fetch failed") ||
+    message.includes("econnreset") ||
+    message.includes("etimedout") ||
+    message.includes("socket hang up") ||
+    message.includes("other side closed")
+  );
+}
+
+function formatLmStudioFetchError(url, error) {
+  const rawMessage = String(error?.message || "Unknown LM Studio error");
+  const lowerMessage = rawMessage.toLowerCase();
+
+  if (
+    lowerMessage.includes("fetch failed") ||
+    lowerMessage.includes("econnrefused") ||
+    lowerMessage.includes("connect") ||
+    lowerMessage.includes("socket hang up") ||
+    lowerMessage.includes("other side closed")
+  ) {
+    return `Could not reach LM Studio at ${url}. Confirm the LM Studio Developer Server is running and that the saved endpoint is correct. Original error: ${rawMessage}`;
+  }
+
+  return rawMessage;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryTranscriptionFetch(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("fetch failed") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("etimedout") ||
+    message.includes("socket hang up") ||
+    message.includes("other side closed")
+  );
+}
+
+function formatTranscriptionFetchError(url, error) {
+  const rawMessage = String(error?.message || "Unknown transcription error");
+  const lowerMessage = rawMessage.toLowerCase();
+
+  if (
+    lowerMessage.includes("fetch failed") ||
+    lowerMessage.includes("econnrefused") ||
+    lowerMessage.includes("connect") ||
+    lowerMessage.includes("socket hang up") ||
+    lowerMessage.includes("other side closed")
+  ) {
+    return `Could not reach the transcription service at ${url}. Confirm LocalAI or your OpenAI-compatible speech-to-text server is running and that the saved transcription base URL is correct. Original error: ${rawMessage}`;
+  }
+
+  return rawMessage;
 }
 
 async function handleModels(response) {
@@ -1442,6 +1914,54 @@ async function handleModels(response) {
       details: error.message,
     });
   }
+}
+
+async function fetchTranscriptionService(pathname, options = {}) {
+  const url = `${transcriptionConfig.baseUrl}${pathname}`;
+  const authorizationHeader = transcriptionConfig.apiKey
+    ? { Authorization: `Bearer ${transcriptionConfig.apiKey}` }
+    : {};
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...authorizationHeader,
+          ...(options.headers || {}),
+        },
+      });
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json")
+        ? await response.json()
+        : await response.text();
+
+      if (!response.ok) {
+        const errorMessage =
+          typeof payload === "string"
+            ? payload
+            : payload?.error?.message ||
+              payload?.message ||
+              "Transcription request failed.";
+
+        throw new Error(errorMessage);
+      }
+
+      return payload;
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === 0 && shouldRetryTranscriptionFetch(error)) {
+        await delay(250);
+        continue;
+      }
+
+      throw new Error(formatTranscriptionFetchError(url, error));
+    }
+  }
+
+  throw new Error(formatTranscriptionFetchError(url, lastError));
 }
 
 async function handleSpeak(request, response) {
@@ -1561,12 +2081,324 @@ async function handleConfigPost(request, response) {
   }
 }
 
+async function executeAgentToolCall(toolCall, options) {
+  const toolName = toolCall?.function?.name || "";
+  const args = parseJsonObject(toolCall?.function?.arguments);
+
+  switch (toolName) {
+    case "get_current_datetime":
+      return {
+        content: JSON.stringify({
+          ok: true,
+          ...formatDateTimeParts(new Date()),
+        }),
+        sources: [],
+      };
+    case "search_internet": {
+      if (!options.useInternet) {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            error: "Internet search is not enabled for this request.",
+          }),
+          sources: [],
+        };
+      }
+
+      const query = typeof args.query === "string" ? args.query.trim() : "";
+      if (!query) {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            error: "A search query is required.",
+          }),
+          sources: [],
+        };
+      }
+
+      const sources = await searchInternet(query);
+      return {
+        content: JSON.stringify({
+          ok: true,
+          query,
+          results: sources,
+        }),
+        sources,
+      };
+    }
+    case "computer_control_request": {
+      const request = typeof args.request === "string" ? args.request.trim() : "";
+      if (!request) {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            error: "A computer control request is required.",
+          }),
+          sources: [],
+        };
+      }
+
+      const action = parseComputerControlRequest(request);
+      if (!action) {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            error: "That computer action was not recognized.",
+          }),
+          sources: [],
+        };
+      }
+
+      if (action.type === "run_command" || action.type === "paste_to_codex") {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            error:
+              "Agent mode does not allow arbitrary shell commands or Codex window automation.",
+          }),
+          sources: [],
+        };
+      }
+
+      const result = await executeComputerControl(action);
+      return {
+        content: JSON.stringify({
+          ok: true,
+          request,
+          action: action.type,
+          result,
+        }),
+        sources: [],
+      };
+    }
+    case "send_email": {
+      const intent = args.intent === "send" ? "send" : "draft";
+      const to = typeof args.to === "string" ? args.to.trim() : "";
+      const subject =
+        typeof args.subject === "string" && args.subject.trim()
+          ? args.subject.trim()
+          : "Message from your local assistant";
+      const body = typeof args.body === "string" ? args.body.trim() : "";
+
+      if (!to) {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            error: "An email recipient is required.",
+          }),
+          sources: [],
+        };
+      }
+
+      const emailRequest = { intent, to, subject, body };
+      if (intent === "send") {
+        await sendSmtpEmail(emailRequest);
+        return {
+          content: JSON.stringify({
+            ok: true,
+            intent,
+            to,
+            subject,
+            result: `I sent the email to ${to}.`,
+          }),
+          sources: [],
+        };
+      }
+
+      openMailtoDraft(buildMailtoUrl(emailRequest));
+      return {
+        content: JSON.stringify({
+          ok: true,
+          intent,
+          to,
+          subject,
+          result: `I opened an email draft to ${to}.`,
+        }),
+        sources: [],
+      };
+    }
+    default:
+      return {
+        content: JSON.stringify({
+          ok: false,
+          error: `Unsupported tool: ${toolName || "unknown"}.`,
+        }),
+        sources: [],
+      };
+  }
+}
+
+async function buildStandardChatPayload({
+  messages,
+  model,
+  useInternet,
+  temperature,
+  maxTokens,
+  latestUserContent,
+}) {
+  let searchSources = [];
+  const systemMessages = [ASSISTANT_GUARDRAIL, buildDateTimeContextMessage()];
+
+  if (useInternet) {
+    searchSources = await searchInternet(latestUserContent || "");
+    if (!searchSources.length) {
+      return {
+        status: 200,
+        body: {
+          message:
+            "Internet search is enabled, but I couldn't find grounded results for that request.",
+          usage: null,
+          sources: [],
+        },
+      };
+    }
+
+    systemMessages.push(buildInternetGroundingMessage(latestUserContent || "", searchSources));
+  }
+
+  const payload = await fetchLmStudio("/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({
+      model,
+      messages: [...systemMessages, ...messages],
+      temperature,
+      max_tokens: maxTokens,
+    }),
+  });
+
+  const content = getMessageTextContent(payload?.choices?.[0]?.message);
+  if (!content) {
+    return {
+      status: 502,
+      body: {
+        error: "LM Studio returned an empty assistant response.",
+        raw: payload,
+      },
+    };
+  }
+
+  return {
+    status: 200,
+    body: {
+      message: stripReasoningBlocks(content) || content,
+      usage: payload.usage || null,
+      sources: searchSources,
+    },
+  };
+}
+
+async function buildAgentChatPayload({
+  messages,
+  model,
+  useInternet,
+  temperature,
+  maxTokens,
+}) {
+  const agentMessages = [
+    ASSISTANT_GUARDRAIL,
+    buildDateTimeContextMessage(),
+    buildAgentModeMessage(useInternet),
+    ...messages,
+  ];
+  const tools = buildAgentToolDefinitions(useInternet);
+  let gatheredSources = [];
+  const reasoningTrace = [];
+  let traceStepNumber = 1;
+
+  for (let step = 0; step < AGENT_LOOP_LIMIT; step += 1) {
+    const payload = await fetchLmStudio("/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model,
+        messages: agentMessages,
+        tools,
+        tool_choice: "auto",
+        temperature,
+        max_tokens: maxTokens,
+      }),
+    });
+
+    const assistantMessage = payload?.choices?.[0]?.message || {};
+    const content = getMessageTextContent(assistantMessage);
+    const toolCalls = Array.isArray(assistantMessage.tool_calls)
+      ? assistantMessage.tool_calls.slice(0, AGENT_TOOL_CALL_LIMIT)
+      : [];
+
+    if (!toolCalls.length) {
+      if (!content) {
+        return {
+          status: 502,
+          body: {
+            error: "LM Studio returned an empty agent response.",
+            raw: payload,
+          },
+        };
+      }
+
+      return {
+        status: 200,
+        body: {
+          message: stripReasoningBlocks(content) || content,
+          usage: payload.usage || null,
+          sources: gatheredSources,
+          reasoningTrace,
+        },
+      };
+    }
+
+    const normalizedToolCalls = toolCalls.map((toolCall, index) => ({
+      id:
+        typeof toolCall?.id === "string" && toolCall.id.trim()
+          ? toolCall.id
+          : `tool_${step + 1}_${index + 1}_${crypto.randomUUID()}`,
+      type: "function",
+      function: {
+        name: toolCall?.function?.name || "",
+        arguments:
+          typeof toolCall?.function?.arguments === "string"
+            ? toolCall.function.arguments
+            : "{}",
+      },
+    }));
+
+    agentMessages.push({
+      role: "assistant",
+      content: content || "",
+      tool_calls: normalizedToolCalls,
+    });
+
+    for (const toolCall of normalizedToolCalls) {
+      const result = await executeAgentToolCall(toolCall, { useInternet });
+      gatheredSources = mergeSearchSources(gatheredSources, result.sources || []);
+      reasoningTrace.push(buildAgentTraceEntry(traceStepNumber, toolCall, result));
+      traceStepNumber += 1;
+      agentMessages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: result.content,
+      });
+    }
+  }
+
+  return {
+    status: 200,
+    body: {
+      message:
+        "Agent mode reached its step limit before finishing. Please try again with a more specific request.",
+      usage: null,
+      sources: gatheredSources,
+      reasoningTrace,
+    },
+  };
+}
+
 async function handleChat(request, response) {
   try {
     const body = await readJsonBody(request);
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const model = typeof body.model === "string" ? body.model : "";
     const useInternet = body.useInternet === true;
+    const agentMode = body.agentMode === true;
     const temperature =
       typeof body.temperature === "number" ? body.temperature : 0.7;
     const maxTokens =
@@ -1591,6 +2423,42 @@ async function handleChat(request, response) {
       sendJson(response, 200, {
         message: directDateTimeAnswer,
         usage: null,
+      });
+      return;
+    }
+
+    const grammarCheckRequest = parseGrammarCheckRequest(latestUserMessage?.content);
+    if (grammarCheckRequest) {
+      const payload = await fetchLmStudio("/v1/chat/completions", {
+        method: "POST",
+        body: JSON.stringify({
+          model,
+          messages: buildGrammarCheckMessages(grammarCheckRequest.text),
+          temperature: 0.2,
+          max_tokens: Math.min(
+            700,
+            Math.max(180, Math.ceil(grammarCheckRequest.text.length * 1.5))
+          ),
+        }),
+      });
+
+      const content = getMessageTextContent(payload?.choices?.[0]?.message);
+
+      if (!content) {
+        sendJson(response, 502, {
+          error: "LM Studio returned an empty grammar-check response.",
+          raw: payload,
+        });
+        return;
+      }
+
+      sendJson(response, 200, {
+        message: stripReasoningBlocks(content) || content,
+        usage: payload.usage || null,
+        action: {
+          type: "grammar_check",
+          target: null,
+        },
       });
       return;
     }
@@ -1663,13 +2531,35 @@ async function handleChat(request, response) {
       return;
     }
 
-    let searchSources = [];
-    const systemMessages = [ASSISTANT_GUARDRAIL, buildDateTimeContextMessage()];
-
-    if (useInternet) {
+    if (agentMode) {
       try {
-        searchSources = await searchInternet(latestUserMessage?.content || "");
-      } catch (error) {
+        const result = await buildAgentChatPayload({
+          messages,
+          model,
+          useInternet,
+          temperature,
+          maxTokens,
+        });
+        sendJson(response, result.status, result.body);
+        return;
+      } catch (_) {
+        // Fall back to standard chat below.
+      }
+    }
+
+    try {
+      const result = await buildStandardChatPayload({
+        messages,
+        model,
+        useInternet,
+        temperature,
+        maxTokens,
+        latestUserContent: latestUserMessage?.content || "",
+      });
+      sendJson(response, result.status, result.body);
+      return;
+    } catch (error) {
+      if (useInternet) {
         sendJson(response, 200, {
           message: `Internet search is enabled, but I couldn't search right now: ${error.message}`,
           usage: null,
@@ -1678,46 +2568,8 @@ async function handleChat(request, response) {
         return;
       }
 
-      if (!searchSources.length) {
-        sendJson(response, 200, {
-          message:
-            "Internet search is enabled, but I couldn't find grounded results for that request.",
-          usage: null,
-          sources: [],
-        });
-        return;
-      }
-
-      systemMessages.push(
-        buildInternetGroundingMessage(latestUserMessage?.content || "", searchSources)
-      );
+      throw error;
     }
-
-    const payload = await fetchLmStudio("/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({
-        model,
-        messages: [...systemMessages, ...messages],
-        temperature,
-        max_tokens: maxTokens,
-      }),
-    });
-
-    const content = payload?.choices?.[0]?.message?.content;
-
-    if (!content) {
-      sendJson(response, 502, {
-        error: "LM Studio returned an empty assistant response.",
-        raw: payload,
-      });
-      return;
-    }
-
-    sendJson(response, 200, {
-      message: content,
-      usage: payload.usage || null,
-      sources: searchSources,
-    });
   } catch (error) {
     sendJson(response, 502, {
       error: "Chat request failed.",

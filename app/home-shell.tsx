@@ -44,7 +44,18 @@ const pageMarkup = `
       <section class="shortcut-card">
         <div class="section-head">
           <h3>Quick actions</h3>
-          <span class="badge badge-soft">Local shortcuts</span>
+          <div class="shortcut-head-actions">
+            <span class="badge badge-soft">Local shortcuts</span>
+            <button
+              id="toggle-control-panel"
+              class="ghost-button control-panel-toggle"
+              type="button"
+              aria-expanded="true"
+              aria-controls="control-panel"
+            >
+              Hide panel
+            </button>
+          </div>
         </div>
         <div class="shortcut-grid">
           <button class="shortcut-tile" type="button" data-prompt="Plan my day and give me the top three priorities.">
@@ -84,6 +95,24 @@ const pageMarkup = `
             <span class="shortcut-kicker">Command</span>
             <strong>Generate command</strong>
             <span class="shortcut-note">pnpm, git, PowerShell</span>
+          </button>
+          <button
+            class="shortcut-tile"
+            type="button"
+            data-prompt="Grammar check: Paste your text after this sentence and I will correct grammar, spelling, punctuation, and clarity while preserving your meaning."
+          >
+            <span class="shortcut-kicker">Writing</span>
+            <strong>Grammar check</strong>
+            <span class="shortcut-note">Correct and polish text</span>
+          </button>
+          <button
+            class="shortcut-tile"
+            type="button"
+            data-prompt="Show me the hidden gems in Microsoft Lists, especially custom templates, conditional formatting, and integrations with other Microsoft tools. Give practical examples I can use."
+          >
+            <span class="shortcut-kicker">Workflow</span>
+            <strong>Microsoft Lists</strong>
+            <span class="shortcut-note">Templates and integrations</span>
           </button>
         </div>
       </section>
@@ -129,7 +158,13 @@ const pageMarkup = `
         <pre id="visual-screen-json" class="visual-screen-json" hidden></pre>
       </section>
 
-      <section id="chat-log" class="chat-log" aria-live="polite"></section>
+      <section class="chat-log-shell">
+        <div class="section-head chat-log-head">
+          <h3>Conversation</h3>
+          <span class="badge badge-soft">Session log</span>
+        </div>
+        <section id="chat-log" class="chat-log" aria-live="polite"></section>
+      </section>
 
       <form id="composer" class="composer">
         <label class="composer-field" for="message-input">
@@ -165,7 +200,7 @@ const pageMarkup = `
     </section>
   </main>
 
-  <aside class="control-panel">
+  <aside id="control-panel" class="control-panel">
     <div class="brand-block">
       <p class="eyebrow">Local Voice Core</p>
       <h2>Control dock</h2>
@@ -274,6 +309,10 @@ const pageMarkup = `
           <span>Use internet for grounded answers</span>
         </label>
         <label class="toggle">
+          <input id="agent-mode" type="checkbox" />
+          <span>Agent mode for multi-step tasks</span>
+        </label>
+        <label class="toggle">
           <input id="hands-free" type="checkbox" />
           <span>Hands-free follow-up listening</span>
         </label>
@@ -354,16 +393,16 @@ const pageMarkup = `
         <input
           id="transcription-base-url"
           type="url"
-          placeholder="https://api.openai.com/v1"
+          placeholder="http://127.0.0.1:8080/v1"
         />
       </label>
 
       <label class="field">
-        <span>API key</span>
+        <span>API key (optional)</span>
         <input
           id="transcription-api-key"
           type="password"
-          placeholder="OpenAI or compatible API key"
+          placeholder="Optional for LocalAI"
         />
       </label>
 
@@ -372,7 +411,7 @@ const pageMarkup = `
         <input
           id="transcription-model"
           type="text"
-          placeholder="gpt-4o-mini-transcribe"
+          placeholder="whisper-1"
         />
       </label>
 
@@ -387,7 +426,7 @@ const pageMarkup = `
       </label>
 
       <p id="transcription-note" class="helper-text">
-        The API key is write-only here. Leave it blank to keep the current saved key.
+        LocalAI usually does not need an API key. Leave this blank to keep any saved value.
       </p>
     </section>
 
@@ -446,6 +485,25 @@ const pageMarkup = `
       <p id="screen-transcript-status" class="helper-text">
         Capture is idle. Share a tab and turn on audio for the best live transcript results.
       </p>
+    </section>
+
+    <section class="panel-card agent-queue-card">
+      <div class="section-head">
+        <h3>Agent action queue</h3>
+        <div class="button-row">
+          <button id="run-approved-agent-actions" class="ghost-button" type="button" disabled>
+            Resume approved
+          </button>
+          <button id="clear-agent-queue" class="ghost-button" type="button">
+            Clear queue
+          </button>
+        </div>
+      </div>
+
+      <p id="agent-queue-status" class="helper-text">
+        Agent mode will show queued actions and approvals here.
+      </p>
+      <div id="agent-action-queue" class="agent-action-queue"></div>
     </section>
 
     <section class="panel-card status-card">
