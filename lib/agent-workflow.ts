@@ -15,6 +15,14 @@ import {
   type AgentOutputRecord,
 } from "@/lib/agent-gateway";
 
+export type AgentThinkingLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh";
+
 export type AgentLlmMessage = {
   role: "system" | "user" | "assistant";
   content: string;
@@ -104,6 +112,30 @@ type AgentWorkflowDependencies = {
     result: string;
     record: AgentOutputRecord;
   };
+  listJsonRecords(input: { kind?: string; limit?: number }): AgentOutputRecord[];
+  readJsonRecord(input: {
+    relativePath?: string;
+    id?: string;
+    label?: string;
+  }): {
+    record: AgentOutputRecord;
+    data: Record<string, any> | null;
+    error: string | null;
+  } | null;
+  getSessionSnapshot(input: {
+    historyLimit?: number;
+    memoryLimit?: number;
+    outputLimit?: number;
+  }): {
+    history: Array<Record<string, any>>;
+    memories: AgentMemoryEntry[];
+    outputs: AgentOutputRecord[];
+    counts: {
+      history: number;
+      memories: number;
+      outputs: number;
+    };
+  };
 };
 
 const plannerMessageSchema = z.object({
@@ -172,6 +204,10 @@ const workflowInputSchema = z.object({
   useInternet: z.boolean().default(false),
   temperature: z.number().default(0.7),
   maxTokens: z.number().default(500),
+  thinkingLevel: z
+    .enum(["off", "minimal", "low", "medium", "high", "xhigh"])
+    .default("medium"),
+  verbose: z.boolean().default(false),
 });
 
 const workflowStateSchema = z.object({
@@ -201,6 +237,32 @@ const reviewOutputSchema = z.object({
 
 function lastUserMessage(messages: AgentLlmMessage[]) {
   return [...messages].reverse().find((message) => message.role === "user")?.content || "";
+}
+
+function lastAssistantMessage(messages: AgentLlmMessage[]) {
+  return [...messages].reverse().find((message) => message.role === "assistant")?.content || "";
+}
+
+function recentUserMessages(messages: AgentLlmMessage[], limit = 3) {
+  return messages.filter((message) => message.role === "user").slice(-limit);
+}
+
+function describeThinkingLevel(thinkingLevel: AgentThinkingLevel) {
+  switch (thinkingLevel) {
+    case "off":
+      return "Keep reasoning very light and act only when the next step is obvious.";
+    case "minimal":
+      return "Use minimal reasoning and prefer the shortest workable plan.";
+    case "low":
+      return "Use light reasoning and avoid extra decomposition unless needed.";
+    case "high":
+      return "Reason carefully, verify dependencies, and prefer stronger continuity.";
+    case "xhigh":
+      return "Reason very carefully, inspect prior outputs when helpful, and optimize for correctness over brevity.";
+    case "medium":
+    default:
+      return "Use balanced reasoning depth and avoid unnecessary extra steps.";
+  }
 }
 
 function compactText(value: unknown, maxLength = 180) {
@@ -415,10 +477,14 @@ function buildPlannerPrompt(
   deps: AgentWorkflowDependencies
 ) {
   const userText = lastUserMessage(input.messages).trim();
-  const recentMessages = input.messages
-    .slice(-6)
-    .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+  const userContext = recentUserMessages(input.messages)
+    .map((message, index, entries) => {
+      const label =
+        index === entries.length - 1 ? "LATEST USER REQUEST" : `USER CONTEXT ${index + 1}`;
+      return `${label}: ${message.content}`;
+    })
     .join("\n\n");
+  const priorAssistantReply = compactText(lastAssistantMessage(input.messages), 500);
   const systemPrompt =
     input.messages.find((message) => message.role === "system")?.content || "";
   const injectedContext = deps.gateway.buildInjectedContext({
@@ -435,6 +501,8 @@ function buildPlannerPrompt(
         "Create a compact JSON action plan, not a final answer. " +
         "Available tools include date/time lookup, internet search, webpage extraction, local computer control, Home Assistant actions, email, memory read/write, and JSON output persistence. " +
         "Use research-agent for time, search, scraping, and memory lookup tasks. Use operations-agent for local computer, Home Assistant, email, memory writes, and JSON record writes. " +
+        "You can also inspect previously saved structured outputs and recent session state before continuing prior work. " +
+        "Focus on the latest user request. Do not restate earlier assistant replies unless they are required to interpret the latest request. " +
         "Return JSON with keys goal, summary, and actions. Each action must contain owner, tool, request, title, description, and args. " +
         "If no tool is needed, return an empty actions array.\n\n" +
         injectedContext,
@@ -442,8 +510,12 @@ function buildPlannerPrompt(
     {
       role: "user" as const,
       content:
+        `Thinking level: ${input.thinkingLevel}\n` +
+        `Planning guidance: ${describeThinkingLevel(input.thinkingLevel)}\n` +
+        `Verbose final answer requested: ${input.verbose ? "yes" : "no"}\n` +
         `Use internet: ${input.useInternet ? "yes" : "no"}\n` +
-        `Recent conversation:\n${recentMessages}\n\n` +
+        `Recent user context:\n${userContext || "No earlier user context."}\n\n` +
+        `Most recent assistant reply:\n${priorAssistantReply || "None"}\n\n` +
         `Latest user request:\n${userText}`,
     },
   ];
@@ -664,6 +736,56 @@ function normalizeQueueItem(
       nextItem.status = "approved";
       return nextItem;
     }
+    case "list_json_records": {
+      const kind =
+        typeof nextItem.args.kind === "string" && nextItem.args.kind.trim()
+          ? nextItem.args.kind.trim()
+          : "";
+      const limit = Math.max(1, Math.min(Number(nextItem.args.limit) || 10, 20));
+      nextItem.args = { kind, limit };
+      nextItem.title = nextItem.title || "List saved outputs";
+      nextItem.description =
+        nextItem.description || (kind ? `List saved ${kind} outputs.` : "List recent saved outputs.");
+      nextItem.safetyTier = "safe";
+      nextItem.status = "approved";
+      return nextItem;
+    }
+    case "read_json_record": {
+      const relativePath =
+        typeof nextItem.args.relativePath === "string" && nextItem.args.relativePath.trim()
+          ? nextItem.args.relativePath.trim()
+          : "";
+      const id =
+        typeof nextItem.args.id === "string" && nextItem.args.id.trim()
+          ? nextItem.args.id.trim()
+          : "";
+      const label =
+        typeof nextItem.args.label === "string" && nextItem.args.label.trim()
+          ? nextItem.args.label.trim()
+          : compactText(nextItem.request, 120);
+      nextItem.args = { relativePath, id, label };
+      nextItem.title = nextItem.title || "Read saved output";
+      nextItem.description =
+        nextItem.description ||
+        compactText(relativePath || id || label || "Read a previously saved JSON output.");
+      nextItem.safetyTier = relativePath || id || label ? "safe" : "blocked";
+      nextItem.status = relativePath || id || label ? "approved" : "blocked";
+      nextItem.error =
+        relativePath || id || label ? undefined : "A saved output path, id, or label is required.";
+      return nextItem;
+    }
+    case "get_session_snapshot": {
+      const historyLimit = Math.max(1, Math.min(Number(nextItem.args.historyLimit) || 6, 12));
+      const memoryLimit = Math.max(1, Math.min(Number(nextItem.args.memoryLimit) || 5, 10));
+      const outputLimit = Math.max(1, Math.min(Number(nextItem.args.outputLimit) || 5, 10));
+      nextItem.args = { historyLimit, memoryLimit, outputLimit };
+      nextItem.title = nextItem.title || "Inspect session snapshot";
+      nextItem.description =
+        nextItem.description || "Review recent history, memory, and saved outputs for continuity.";
+      nextItem.safetyTier = "safe";
+      nextItem.status = "approved";
+      return nextItem;
+    }
     default:
       return nextItem;
   }
@@ -768,6 +890,52 @@ async function executeQueueItem(
         sources: [],
       };
     }
+    case "list_json_records": {
+      const records = deps.listJsonRecords({
+        kind: item.args.kind || "",
+        limit: item.args.limit || 10,
+      });
+      return {
+        result: records.length
+          ? `Found ${records.length} saved JSON record${records.length === 1 ? "" : "s"}.`
+          : "No saved JSON records matched that request.",
+        sources: [],
+      };
+    }
+    case "read_json_record": {
+      const record = deps.readJsonRecord({
+        relativePath: item.args.relativePath || "",
+        id: item.args.id || "",
+        label: item.args.label || "",
+      });
+
+      if (!record) {
+        throw new Error("That saved JSON record could not be found.");
+      }
+
+      if (record.error) {
+        throw new Error(record.error);
+      }
+
+      return {
+        result: `Loaded saved output "${record.record.label}".`,
+        sources: [],
+      };
+    }
+    case "get_session_snapshot": {
+      const snapshot = deps.getSessionSnapshot({
+        historyLimit: item.args.historyLimit || 6,
+        memoryLimit: item.args.memoryLimit || 5,
+        outputLimit: item.args.outputLimit || 5,
+      });
+      return {
+        result:
+          `Reviewed ${snapshot.counts.history} recent history entr${snapshot.counts.history === 1 ? "y" : "ies"}, ` +
+          `${snapshot.counts.memories} memor${snapshot.counts.memories === 1 ? "y" : "ies"}, and ` +
+          `${snapshot.counts.outputs} saved output${snapshot.counts.outputs === 1 ? "" : "s"}.`,
+        sources: [],
+      };
+    }
     default:
       throw new Error("Unsupported action.");
   }
@@ -778,7 +946,15 @@ function buildSummaryPrompt(params: {
   queue: AgentWorkflowActionQueueItem[];
   sources: AgentSearchSource[];
   gatewayContext: string;
+  thinkingLevel: AgentThinkingLevel;
+  verbose: boolean;
 }) {
+  const latestUserRequest = lastUserMessage(params.messages).trim();
+  const userContext = recentUserMessages(params.messages)
+    .slice(0, -1)
+    .map((message, index) => `USER CONTEXT ${index + 1}: ${message.content}`)
+    .join("\n\n");
+  const priorAssistantReply = compactText(lastAssistantMessage(params.messages), 500);
   const actionSummary = params.queue
     .map((item) => {
       const parts = [
@@ -809,16 +985,20 @@ function buildSummaryPrompt(params: {
       content:
         "You are the summarizer for a local agent workflow. " +
         "Write the final answer for the user after the plan, review, and execution stages. " +
+        "Focus on the latest user request, not on replaying prior assistant messages. " +
+        "Only mention earlier assistant replies when they are needed for continuity. " +
+        `${params.verbose ? "Include enough operational detail for an advanced user. " : "Keep the final answer concise and outcome-focused. "}` +
         "Be direct, mention blocked or rejected actions clearly, and cite web sources inline as [1], [2] when they were used.\n\n" +
         params.gatewayContext,
     },
     {
       role: "user" as const,
       content:
-        `Conversation:\n${params.messages
-          .slice(-6)
-          .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
-          .join("\n\n")}\n\n` +
+        `Thinking level: ${params.thinkingLevel}\n` +
+        `Summary guidance: ${describeThinkingLevel(params.thinkingLevel)}\n` +
+        `Latest user request:\n${latestUserRequest || "None"}\n\n` +
+        `Earlier user context:\n${userContext || "No earlier user context."}\n\n` +
+        `Most recent assistant reply:\n${priorAssistantReply || "None"}\n\n` +
         `Action queue:\n${actionSummary || "No actions were executed."}\n\n` +
         `Sources:\n${sourceSummary || "No web sources."}`,
     },
@@ -1134,6 +1314,8 @@ export function createMastraAgentOrchestrator(deps: AgentWorkflowDependencies) {
             useInternet: initData.useInternet,
             trigger: "custom_prompt",
           }),
+          thinkingLevel: initData.thinkingLevel,
+          verbose: initData.verbose,
         }),
         {
           model: initData.model,

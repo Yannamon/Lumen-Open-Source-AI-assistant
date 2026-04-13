@@ -9,6 +9,9 @@ export function initAssistantUi() {
 
   hasInitializedAssistantUi = true;
 
+const DEFAULT_ASSISTANT_PROMPT =
+  "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.";
+
 const defaults = {
   endpoint: "http://127.0.0.1:1234",
   homeAssistantBaseUrl: "",
@@ -19,16 +22,28 @@ const defaults = {
   transcriptionBaseUrl: "http://127.0.0.1:8080/v1",
   transcriptionModel: "whisper-1",
   transcriptionLanguage: "",
+  whatsappPhoneNumber: "",
+  whatsappWebhookUrl: "",
+  whatsappModel: "",
+  whatsappUseInternet: false,
+  whatsappAgentMode: false,
+  whatsappSystemPrompt: DEFAULT_ASSISTANT_PROMPT,
   useInternet: false,
   agentMode: false,
   assistantName: "Lumen",
-  systemPrompt:
-    "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.",
+  systemPrompt: DEFAULT_ASSISTANT_PROMPT,
   autoSpeak: true,
   handsFree: false,
   temperature: 0.7,
   maxTokens: 400,
+  thinkingLevel: "medium",
+  usageMode: "off",
+  verboseAgentMode: false,
   selectedSpeechModel: "",
+  bots: [],
+  activeBotId: "",
+  sessionSummary: "",
+  contextStartIndex: 0,
   screenCaptureSurface: "any",
   panelHidden: false,
   pendingAgentApproval: null,
@@ -37,12 +52,17 @@ const defaults = {
 
 const SCREEN_TRANSCRIPT_CHUNK_MS = 20000;
 const SCREEN_TRANSCRIPT_PROMPT_TAIL_LENGTH = 600;
+const AUTO_COMPACT_ACTIVE_MESSAGE_LIMIT = 12;
+const AUTO_COMPACT_KEEP_RECENT_MESSAGES = 6;
 
 const state = {
   messages: [],
   models: [],
+  allModels: [],
   speechModels: [],
   voices: [],
+  bots: [],
+  activeBotId: "",
   visualExamples: null,
   visualDownloadUrl: null,
   microphones: [],
@@ -62,6 +82,16 @@ const state = {
   screenTranscriptUploadChain: Promise.resolve(),
   agentActionQueue: [],
   pendingAgentApproval: null,
+  whatsappConfiguredModel: "",
+  sessionSummary: "",
+  contextStartIndex: 0,
+  thinkingLevel: "medium",
+  usageMode: "off",
+  verboseAgentMode: false,
+  composerHistoryIndex: -1,
+  composerDraft: "",
+  botPromptRecognition: null,
+  isBotPromptListening: false,
 };
 
 const elements = {
@@ -72,6 +102,17 @@ const elements = {
   modelSelect: document.querySelector("#model-select"),
   voiceSelect: document.querySelector("#voice-select"),
   speechModelSelect: document.querySelector("#speech-model-select"),
+  botSelect: document.querySelector("#bot-select"),
+  newBot: document.querySelector("#new-bot"),
+  saveBot: document.querySelector("#save-bot"),
+  deleteBot: document.querySelector("#delete-bot"),
+  botName: document.querySelector("#bot-name"),
+  botDescription: document.querySelector("#bot-description"),
+  botGreeting: document.querySelector("#bot-greeting"),
+  botBuilderPrompt: document.querySelector("#bot-builder-prompt"),
+  recordBotPrompt: document.querySelector("#record-bot-prompt"),
+  createBotFromPrompt: document.querySelector("#create-bot-from-prompt"),
+  botStudioStatus: document.querySelector("#bot-studio-status"),
   systemPrompt: document.querySelector("#system-prompt"),
   autoSpeak: document.querySelector("#auto-speak"),
   useInternet: document.querySelector("#use-internet"),
@@ -101,6 +142,15 @@ const elements = {
   transcriptionLanguage: document.querySelector("#transcription-language"),
   saveTranscription: document.querySelector("#save-transcription"),
   transcriptionNote: document.querySelector("#transcription-note"),
+  whatsappPhoneNumber: document.querySelector("#whatsapp-phone-number"),
+  whatsappWebhookUrl: document.querySelector("#whatsapp-webhook-url"),
+  whatsappAuthToken: document.querySelector("#whatsapp-auth-token"),
+  whatsappModel: document.querySelector("#whatsapp-model"),
+  whatsappUseInternet: document.querySelector("#whatsapp-use-internet"),
+  whatsappAgentMode: document.querySelector("#whatsapp-agent-mode"),
+  whatsappSystemPrompt: document.querySelector("#whatsapp-system-prompt"),
+  saveWhatsApp: document.querySelector("#save-whatsapp"),
+  whatsappNote: document.querySelector("#whatsapp-note"),
   connectionStatus: document.querySelector("#connection-status"),
   speechSupport: document.querySelector("#speech-support"),
   micSelect: document.querySelector("#mic-select"),
@@ -108,10 +158,12 @@ const elements = {
   micNote: document.querySelector("#mic-note"),
   micStatus: document.querySelector("#mic-status"),
   speechOutputStatus: document.querySelector("#speech-output-status"),
+  modelsInventory: document.querySelector("#models-inventory"),
   smtpStatus: document.querySelector("#smtp-status"),
   internetStatus: document.querySelector("#internet-status"),
   homeAssistantStatus: document.querySelector("#home-assistant-status"),
   transcriptionStatus: document.querySelector("#transcription-status"),
+  whatsappStatus: document.querySelector("#whatsapp-status"),
   heroTitle: document.querySelector("#hero-title"),
   heroOrb: document.querySelector(".hero-orb"),
   listenButton: document.querySelector("#listen-button"),
@@ -236,7 +288,226 @@ function readSettings() {
   }
 }
 
+function createBotId() {
+  return `bot_${globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeBotProfile(profile = {}, fallback = {}) {
+  const normalizedTemperature =
+    typeof profile.temperature === "number"
+      ? profile.temperature
+      : typeof fallback.temperature === "number"
+        ? fallback.temperature
+        : defaults.temperature;
+  const normalizedMaxTokens =
+    typeof profile.maxTokens === "number"
+      ? profile.maxTokens
+      : typeof fallback.maxTokens === "number"
+        ? fallback.maxTokens
+        : defaults.maxTokens;
+  const assistantName =
+    String(profile.assistantName || fallback.assistantName || defaults.assistantName).trim() ||
+    defaults.assistantName;
+
+  return {
+    id: String(profile.id || fallback.id || createBotId()).trim() || createBotId(),
+    name:
+      String(profile.name || fallback.name || assistantName).trim() || defaults.assistantName,
+    description: String(profile.description || fallback.description || "").trim(),
+    assistantName,
+    greeting: String(profile.greeting || fallback.greeting || "").trim(),
+    systemPrompt:
+      String(profile.systemPrompt || fallback.systemPrompt || defaults.systemPrompt).trim() ||
+      defaults.systemPrompt,
+    selectedModel: String(profile.selectedModel || fallback.selectedModel || "").trim(),
+    selectedSpeechModel: String(
+      profile.selectedSpeechModel || fallback.selectedSpeechModel || ""
+    ).trim(),
+    selectedVoice: String(profile.selectedVoice || fallback.selectedVoice || "").trim(),
+    useInternet:
+      typeof profile.useInternet === "boolean"
+        ? profile.useInternet
+        : typeof fallback.useInternet === "boolean"
+          ? fallback.useInternet
+          : defaults.useInternet,
+    agentMode:
+      typeof profile.agentMode === "boolean"
+        ? profile.agentMode
+        : typeof fallback.agentMode === "boolean"
+          ? fallback.agentMode
+          : defaults.agentMode,
+    handsFree:
+      typeof profile.handsFree === "boolean"
+        ? profile.handsFree
+        : typeof fallback.handsFree === "boolean"
+          ? fallback.handsFree
+          : defaults.handsFree,
+    autoSpeak:
+      typeof profile.autoSpeak === "boolean"
+        ? profile.autoSpeak
+        : typeof fallback.autoSpeak === "boolean"
+          ? fallback.autoSpeak
+          : defaults.autoSpeak,
+    temperature: Math.min(1.2, Math.max(0, normalizedTemperature)),
+    maxTokens: Math.max(100, Math.min(1200, normalizedMaxTokens)),
+  };
+}
+
+function buildBotProfileFromCurrentControls(overrides = {}) {
+  const fallbackBot = state.bots.find((bot) => bot.id === state.activeBotId) || {};
+
+  return normalizeBotProfile(
+    {
+      ...fallbackBot,
+      ...overrides,
+      id: overrides.id || fallbackBot.id || state.activeBotId || createBotId(),
+      name: elements.botName?.value || fallbackBot.name || elements.assistantName.value,
+      description: elements.botDescription?.value || fallbackBot.description || "",
+      greeting: elements.botGreeting?.value || fallbackBot.greeting || "",
+      assistantName: elements.assistantName.value,
+      systemPrompt: elements.systemPrompt.value,
+      selectedModel: elements.modelSelect.value,
+      selectedSpeechModel: elements.speechModelSelect.value,
+      selectedVoice: elements.voiceSelect.value,
+      useInternet: elements.useInternet.checked,
+      agentMode: elements.agentMode.checked,
+      handsFree: elements.handsFree.checked,
+      autoSpeak: elements.autoSpeak.checked,
+      temperature: Number(elements.temperature.value),
+      maxTokens: Number(elements.maxTokens.value),
+    },
+    fallbackBot
+  );
+}
+
+function getActiveBot() {
+  return state.bots.find((bot) => bot.id === state.activeBotId) || null;
+}
+
+function populateBotOptions() {
+  if (!elements.botSelect) {
+    return;
+  }
+
+  elements.botSelect.innerHTML = "";
+
+  state.bots.forEach((bot) => {
+    const option = document.createElement("option");
+    option.value = bot.id;
+    option.textContent = bot.name;
+    elements.botSelect.appendChild(option);
+  });
+
+  elements.botSelect.value = state.activeBotId || state.bots[0]?.id || "";
+}
+
+function refreshBotStudioFields() {
+  const activeBot = getActiveBot();
+
+  populateBotOptions();
+
+  if (!activeBot) {
+    if (elements.botName) elements.botName.value = "";
+    if (elements.botDescription) elements.botDescription.value = "";
+    if (elements.botGreeting) elements.botGreeting.value = "";
+    return;
+  }
+
+  if (elements.botName) elements.botName.value = activeBot.name || "";
+  if (elements.botDescription) elements.botDescription.value = activeBot.description || "";
+  if (elements.botGreeting) elements.botGreeting.value = activeBot.greeting || "";
+}
+
+function syncActiveBotFromControls() {
+  if (!state.activeBotId) {
+    return;
+  }
+
+  const botIndex = state.bots.findIndex((bot) => bot.id === state.activeBotId);
+  const nextBot = buildBotProfileFromCurrentControls({
+    id: state.activeBotId,
+  });
+
+  if (botIndex === -1) {
+    state.bots.push(nextBot);
+  } else {
+    state.bots[botIndex] = nextBot;
+  }
+}
+
+function applyBotToControls(bot, { persist = true } = {}) {
+  if (!bot) {
+    return;
+  }
+
+  const normalizedBot = normalizeBotProfile(bot);
+  state.activeBotId = normalizedBot.id;
+  elements.assistantName.value = normalizedBot.assistantName;
+  elements.systemPrompt.value = normalizedBot.systemPrompt;
+  elements.modelSelect.value = normalizedBot.selectedModel;
+  elements.speechModelSelect.value = normalizedBot.selectedSpeechModel;
+  elements.voiceSelect.value = normalizedBot.selectedVoice;
+  elements.useInternet.checked = normalizedBot.useInternet;
+  elements.agentMode.checked = normalizedBot.agentMode;
+  elements.handsFree.checked = normalizedBot.handsFree;
+  elements.autoSpeak.checked = normalizedBot.autoSpeak;
+  elements.temperature.value = String(normalizedBot.temperature);
+  elements.maxTokens.value = String(normalizedBot.maxTokens);
+  updateRangeLabels();
+  updateHeroTitle();
+  updateSpeechOutputStatus();
+  if (normalizedBot.greeting) {
+    elements.liveTranscript.textContent = normalizedBot.greeting;
+  }
+  refreshBotStudioFields();
+
+  if (persist) {
+    saveSettings();
+  }
+}
+
+function ensureBotProfiles(settings) {
+  const normalizedSavedBots = Array.isArray(settings?.bots)
+    ? settings.bots.map((bot) => normalizeBotProfile(bot))
+    : [];
+
+  if (normalizedSavedBots.length) {
+    state.bots = normalizedSavedBots;
+    state.activeBotId =
+      normalizedSavedBots.find((bot) => bot.id === settings?.activeBotId)?.id ||
+      normalizedSavedBots[0]?.id ||
+      "";
+    return;
+  }
+
+  const starterBot = normalizeBotProfile({
+    id: createBotId(),
+    name: settings?.assistantName || defaults.assistantName,
+    description: "Your primary local assistant",
+    assistantName: settings?.assistantName || defaults.assistantName,
+    greeting: "",
+    systemPrompt: settings?.systemPrompt || defaults.systemPrompt,
+    selectedModel: settings?.selectedModel || "",
+    selectedSpeechModel: settings?.selectedSpeechModel || "",
+    selectedVoice: settings?.selectedVoice || "",
+    useInternet: Boolean(settings?.useInternet),
+    agentMode: Boolean(settings?.agentMode),
+    handsFree: Boolean(settings?.handsFree),
+    autoSpeak:
+      typeof settings?.autoSpeak === "boolean" ? settings.autoSpeak : defaults.autoSpeak,
+    temperature:
+      typeof settings?.temperature === "number" ? settings.temperature : defaults.temperature,
+    maxTokens:
+      typeof settings?.maxTokens === "number" ? settings.maxTokens : defaults.maxTokens,
+  });
+
+  state.bots = [starterBot];
+  state.activeBotId = starterBot.id;
+}
+
 function saveSettings() {
+  syncActiveBotFromControls();
+
   localStorage.setItem(
     "assistant-settings",
     JSON.stringify({
@@ -254,6 +525,13 @@ function saveSettings() {
       transcriptionModel:
         elements.transcriptionModel.value.trim() || defaults.transcriptionModel,
       transcriptionLanguage: elements.transcriptionLanguage.value.trim(),
+      whatsappPhoneNumber: elements.whatsappPhoneNumber.value.trim(),
+      whatsappWebhookUrl: elements.whatsappWebhookUrl.value.trim(),
+      whatsappModel: elements.whatsappModel.value,
+      whatsappUseInternet: elements.whatsappUseInternet.checked,
+      whatsappAgentMode: elements.whatsappAgentMode.checked,
+      whatsappSystemPrompt:
+        elements.whatsappSystemPrompt.value.trim() || defaults.whatsappSystemPrompt,
       useInternet: elements.useInternet.checked,
       agentMode: elements.agentMode.checked,
       systemPrompt: elements.systemPrompt.value.trim() || defaults.systemPrompt,
@@ -261,9 +539,16 @@ function saveSettings() {
       handsFree: elements.handsFree.checked,
       temperature: Number(elements.temperature.value),
       maxTokens: Number(elements.maxTokens.value),
+      thinkingLevel: state.thinkingLevel,
+      usageMode: state.usageMode,
+      verboseAgentMode: state.verboseAgentMode,
       selectedVoice: elements.voiceSelect.value,
       selectedModel: elements.modelSelect.value,
       selectedSpeechModel: elements.speechModelSelect.value,
+      bots: state.bots,
+      activeBotId: state.activeBotId,
+      sessionSummary: state.sessionSummary,
+      contextStartIndex: state.contextStartIndex,
       screenCaptureSurface: elements.screenCaptureSurface.value,
       panelHidden: elements.pageShell.classList.contains("is-panel-hidden"),
       pendingAgentApproval: state.pendingAgentApproval,
@@ -938,7 +1223,36 @@ async function performScrapeRequest(request) {
   return payload.scrape;
 }
 
-function renderMessage(role, content, sources = [], reasoningTrace = []) {
+function formatUsageSummary(usage, mode) {
+  if (!usage || mode === "off") {
+    return "";
+  }
+
+  if (mode === "full") {
+    return JSON.stringify(usage);
+  }
+
+  const promptTokens = usage.prompt_tokens ?? usage.input_tokens ?? null;
+  const completionTokens = usage.completion_tokens ?? usage.output_tokens ?? null;
+  const totalTokens = usage.total_tokens ?? null;
+  const parts = [];
+
+  if (promptTokens !== null) {
+    parts.push(`prompt ${promptTokens}`);
+  }
+
+  if (completionTokens !== null) {
+    parts.push(`completion ${completionTokens}`);
+  }
+
+  if (totalTokens !== null) {
+    parts.push(`total ${totalTokens}`);
+  }
+
+  return parts.join(" | ");
+}
+
+function renderMessage(role, content, sources = [], reasoningTrace = [], usage = null) {
   const fragment = elements.template.content.cloneNode(true);
   const article = fragment.querySelector(".message");
   const roleLabel = fragment.querySelector(".message-role");
@@ -975,7 +1289,7 @@ function renderMessage(role, content, sources = [], reasoningTrace = []) {
   if (role === "assistant" && reasoningTrace.length) {
     const traceNode = document.createElement("details");
     traceNode.className = "message-trace";
-    traceNode.open = true;
+    traceNode.open = state.verboseAgentMode;
 
     const summary = document.createElement("summary");
     summary.className = "message-trace-summary";
@@ -1007,6 +1321,16 @@ function renderMessage(role, content, sources = [], reasoningTrace = []) {
 
     traceNode.appendChild(list);
     article.appendChild(traceNode);
+  }
+
+  if (role === "assistant") {
+    const usageSummary = formatUsageSummary(usage, state.usageMode);
+    if (usageSummary) {
+      const usageNode = document.createElement("p");
+      usageNode.className = "message-usage";
+      usageNode.textContent = `Usage: ${usageSummary}`;
+      article.appendChild(usageNode);
+    }
   }
 
   elements.chatLog.appendChild(fragment);
@@ -1228,6 +1552,7 @@ async function resumeApprovedAgentActions() {
       content: assistantReply,
       sources: Array.isArray(payload.sources) ? payload.sources : [],
       reasoningTrace: Array.isArray(payload.reasoningTrace) ? payload.reasoningTrace : [],
+      usage: payload.usage || null,
     });
     rerenderChat();
     elements.liveTranscript.textContent = "Reply ready.";
@@ -1263,7 +1588,8 @@ function rerenderChat() {
       message.role,
       message.content,
       message.sources || [],
-      message.reasoningTrace || []
+      message.reasoningTrace || [],
+      message.usage || null
     )
   );
 }
@@ -1276,6 +1602,149 @@ function setStatus(target, text, isError = false) {
 function setHelperText(target, text, isError = false) {
   target.textContent = text;
   target.style.color = isError ? "#fda4af" : "";
+}
+
+function stopBotPromptCapture() {
+  if (state.botPromptRecognition) {
+    state.botPromptRecognition.onresult = null;
+    state.botPromptRecognition.onerror = null;
+    state.botPromptRecognition.onend = null;
+    state.botPromptRecognition.stop();
+    state.botPromptRecognition = null;
+  }
+
+  state.isBotPromptListening = false;
+  if (elements.recordBotPrompt) {
+    elements.recordBotPrompt.textContent = "Record prompt";
+  }
+}
+
+function startBotPromptCapture() {
+  const Recognition =
+    window.SpeechRecognition || window.webkitSpeechRecognition || null;
+
+  if (!Recognition) {
+    setHelperText(elements.botStudioStatus, "Voice prompt capture is not available in this browser.", true);
+    return;
+  }
+
+  if (state.isBotPromptListening) {
+    stopBotPromptCapture();
+    setHelperText(elements.botStudioStatus, "Stopped bot prompt recording.");
+    return;
+  }
+
+  if (state.isListening && state.recognition) {
+    state.recognition.stop();
+  }
+
+  const recognition = new Recognition();
+  recognition.lang = "en-US";
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  recognition.continuous = false;
+
+  state.botPromptRecognition = recognition;
+  state.isBotPromptListening = true;
+  elements.recordBotPrompt.textContent = "Stop recording";
+  setHelperText(elements.botStudioStatus, "Listening for a bot creation prompt...");
+
+  recognition.onresult = (event) => {
+    const transcript = Array.from(event.results || [])
+      .map((result) => result?.[0]?.transcript || "")
+      .join(" ")
+      .trim();
+
+    if (transcript && elements.botBuilderPrompt) {
+      elements.botBuilderPrompt.value = elements.botBuilderPrompt.value.trim()
+        ? `${elements.botBuilderPrompt.value.trim()} ${transcript}`
+        : transcript;
+    }
+  };
+
+  recognition.onerror = (event) => {
+    const message =
+      event?.error === "not-allowed"
+        ? "Microphone permission is blocked for bot prompt recording."
+        : `Bot prompt recording failed: ${event?.error || "unknown error"}.`;
+    setHelperText(elements.botStudioStatus, message, true);
+  };
+
+  recognition.onend = () => {
+    const hasPrompt = Boolean(elements.botBuilderPrompt?.value.trim());
+    stopBotPromptCapture();
+    setHelperText(
+      elements.botStudioStatus,
+      hasPrompt
+        ? "Voice prompt captured. Review it, then create the bot."
+        : "Bot prompt recording finished."
+    );
+  };
+
+  recognition.start();
+}
+
+async function createBotFromPrompt() {
+  const prompt = elements.botBuilderPrompt?.value.trim() || "";
+
+  if (!prompt) {
+    setHelperText(elements.botStudioStatus, "Describe the bot you want first, by text or voice.", true);
+    return;
+  }
+
+  if (!elements.modelSelect.value) {
+    setHelperText(elements.botStudioStatus, "Select a chat model before creating a bot.", true);
+    return;
+  }
+
+  elements.createBotFromPrompt.disabled = true;
+  elements.recordBotPrompt.disabled = true;
+  setHelperText(elements.botStudioStatus, "Designing a new bot profile...");
+
+  try {
+    const response = await fetch("/api/bots/create", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prompt,
+        model: elements.modelSelect.value,
+        currentAssistantName: elements.assistantName.value,
+        currentSystemPrompt: elements.systemPrompt.value,
+        availableModels: state.allModels,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.details || payload.error || "Bot creation failed.");
+    }
+
+    const nextBot = normalizeBotProfile(payload.bot, {
+      assistantName: elements.assistantName.value,
+      systemPrompt: elements.systemPrompt.value,
+      selectedModel: elements.modelSelect.value,
+      selectedSpeechModel: elements.speechModelSelect.value,
+      selectedVoice: elements.voiceSelect.value,
+      useInternet: elements.useInternet.checked,
+      agentMode: elements.agentMode.checked,
+      handsFree: elements.handsFree.checked,
+      autoSpeak: elements.autoSpeak.checked,
+      temperature: Number(elements.temperature.value),
+      maxTokens: Number(elements.maxTokens.value),
+    });
+
+    state.bots.push(nextBot);
+    applyBotToControls(nextBot, { persist: false });
+    saveSettings();
+    setHelperText(elements.botStudioStatus, `Created "${nextBot.name}" and switched the workspace to that bot.`);
+  } catch (error) {
+    setHelperText(elements.botStudioStatus, error.message, true);
+  } finally {
+    elements.createBotFromPrompt.disabled = false;
+    elements.recordBotPrompt.disabled = false;
+  }
 }
 
 function syncScreenTranscriptButtons() {
@@ -1645,7 +2114,7 @@ function updateSpeechOutputStatus(note = "") {
   if (selectedSpeechModel) {
     setStatus(
       elements.speechOutputStatus,
-      note || `Browser playback + ${selectedSpeechModel}`
+      note || `Speech polish: ${selectedSpeechModel}. Playback: browser voice`
     );
     return;
   }
@@ -1760,6 +2229,52 @@ function populateSpeechModelOptions(models, defaultSpeechModel) {
   updateSpeechOutputStatus();
 }
 
+function isSpeechPolishCapableModel(model) {
+  return model?.kind === "chat";
+}
+
+function updateModelsInventory(allModels) {
+  if (!elements.modelsInventory) {
+    return;
+  }
+
+  if (!Array.isArray(allModels) || !allModels.length) {
+    elements.modelsInventory.textContent = "LM Studio is reachable, but no models are currently loaded.";
+    return;
+  }
+
+  elements.modelsInventory.textContent =
+    `LM Studio loaded ${allModels.length} model${allModels.length === 1 ? "" : "s"}: ` +
+    allModels.map((model) => `${model.id} [${model.kind}]`).join(", ") +
+    ". Chat and speech-polish selectors show chat-compatible models only.";
+}
+
+function populateWhatsAppModelOptions(models, defaultChatModel) {
+  elements.whatsappModel.innerHTML = "";
+
+  const autoOption = document.createElement("option");
+  autoOption.value = "";
+  autoOption.textContent = "Auto-select best chat model";
+  elements.whatsappModel.appendChild(autoOption);
+
+  models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.id;
+    elements.whatsappModel.appendChild(option);
+  });
+
+  const settings = readSettings();
+  const configuredModel = state.whatsappConfiguredModel || settings.whatsappModel || "";
+  const preferredModel = models.find((model) => model.id === configuredModel)?.id || "";
+
+  elements.whatsappModel.value = preferredModel || "";
+
+  if (!preferredModel && !configuredModel && defaultChatModel) {
+    elements.whatsappModel.value = "";
+  }
+}
+
 async function loadModels() {
   setStatus(elements.connectionStatus, "Connecting...");
 
@@ -1773,9 +2288,11 @@ async function loadModels() {
 
     const allModels = payload.models || [];
     const chatModels = allModels.filter((model) => model.kind === "chat");
-    const speechModels = allModels.filter((model) => model.kind === "tts");
+    const speechModels = allModels.filter(isSpeechPolishCapableModel);
+    state.allModels = allModels;
     state.models = chatModels;
     elements.modelSelect.innerHTML = "";
+    updateModelsInventory(allModels);
 
     if (!chatModels.length) {
       throw new Error("LM Studio is reachable, but no chat models are loaded.");
@@ -1795,14 +2312,18 @@ async function loadModels() {
       chatModels[0]?.id ||
       "";
     populateSpeechModelOptions(speechModels, payload.defaultSpeechModel || "");
+    populateWhatsAppModelOptions(chatModels, payload.defaultModel || "");
 
     setStatus(
       elements.connectionStatus,
-      `Connected to ${payload.baseUrl} with ${chatModels.length} chat model${chatModels.length === 1 ? "" : "s"}`
+      `Connected to ${payload.baseUrl} with ${chatModels.length} chat-compatible model${chatModels.length === 1 ? "" : "s"} out of ${allModels.length} loaded`
     );
     saveSettings();
     return true;
   } catch (error) {
+    if (elements.modelsInventory) {
+      elements.modelsInventory.textContent = "Could not load the LM Studio model inventory.";
+    }
     setStatus(elements.connectionStatus, error.message, true);
     throw error;
   }
@@ -1834,6 +2355,16 @@ async function loadEndpointConfig() {
       payload.transcription?.model || defaults.transcriptionModel;
     elements.transcriptionLanguage.value =
       payload.transcription?.language || defaults.transcriptionLanguage;
+    elements.whatsappPhoneNumber.value =
+      payload.whatsapp?.phoneNumber || defaults.whatsappPhoneNumber;
+    elements.whatsappWebhookUrl.value =
+      payload.whatsapp?.webhookUrl || defaults.whatsappWebhookUrl;
+    elements.whatsappAuthToken.value = "";
+    elements.whatsappUseInternet.checked = Boolean(payload.whatsapp?.useInternet);
+    elements.whatsappAgentMode.checked = Boolean(payload.whatsapp?.agentMode);
+    elements.whatsappSystemPrompt.value =
+      payload.whatsapp?.systemPrompt || defaults.whatsappSystemPrompt;
+    state.whatsappConfiguredModel = payload.whatsapp?.model || "";
     setStatus(
       elements.smtpStatus,
       payload.smtp?.passwordSet
@@ -1866,10 +2397,24 @@ async function loadEndpointConfig() {
           : "Not configured",
       !payload.transcription?.enabled
     );
+    setStatus(
+      elements.whatsappStatus,
+      payload.whatsapp?.enabled
+        ? payload.whatsapp?.model
+          ? `Webhook ready with ${payload.whatsapp.model}`
+          : "Webhook ready, model will auto-select"
+        : payload.whatsapp?.phoneNumber || payload.whatsapp?.webhookUrl
+          ? "Partial setup saved"
+          : "Not configured",
+      !payload.whatsapp?.enabled
+    );
     elements.homeAssistantNote.textContent =
       "The token is write-only here. Leave it blank to keep the current saved token.";
     elements.transcriptionNote.textContent =
       "The API key is optional for LocalAI-compatible servers. Leave it blank to keep the current saved value.";
+    elements.whatsappNote.textContent = payload.whatsapp?.authTokenSet
+      ? "The Twilio auth token is write-only here. Leave it blank to keep signature verification enabled."
+      : "Add your Twilio auth token to verify webhook signatures. Point your Twilio WhatsApp webhook to /api/whatsapp on a public URL.";
     saveSettings();
   } catch (error) {
     const settings = readSettings();
@@ -1887,6 +2432,16 @@ async function loadEndpointConfig() {
       settings.transcriptionModel || defaults.transcriptionModel;
     elements.transcriptionLanguage.value =
       settings.transcriptionLanguage || defaults.transcriptionLanguage;
+    elements.whatsappPhoneNumber.value =
+      settings.whatsappPhoneNumber || defaults.whatsappPhoneNumber;
+    elements.whatsappWebhookUrl.value =
+      settings.whatsappWebhookUrl || defaults.whatsappWebhookUrl;
+    elements.whatsappAuthToken.value = "";
+    elements.whatsappUseInternet.checked = Boolean(settings.whatsappUseInternet);
+    elements.whatsappAgentMode.checked = Boolean(settings.whatsappAgentMode);
+    elements.whatsappSystemPrompt.value =
+      settings.whatsappSystemPrompt || defaults.whatsappSystemPrompt;
+    state.whatsappConfiguredModel = settings.whatsappModel || "";
     elements.screenCaptureSurface.value =
       settings.screenCaptureSurface || defaults.screenCaptureSurface;
   }
@@ -2072,6 +2627,68 @@ async function saveTranscriptionConfig() {
     setStatus(elements.transcriptionStatus, error.message, true);
     elements.transcriptionNote.textContent =
       "Check the LocalAI base URL, model, and language hint, then save again.";
+  }
+}
+
+async function saveWhatsAppConfig() {
+  const whatsappPayload = {
+    phoneNumber: elements.whatsappPhoneNumber.value.trim(),
+    webhookUrl: elements.whatsappWebhookUrl.value.trim(),
+    model: elements.whatsappModel.value,
+    useInternet: elements.whatsappUseInternet.checked,
+    agentMode: elements.whatsappAgentMode.checked,
+    systemPrompt:
+      elements.whatsappSystemPrompt.value.trim() || defaults.whatsappSystemPrompt,
+  };
+
+  if (elements.whatsappAuthToken.value) {
+    whatsappPayload.authToken = elements.whatsappAuthToken.value;
+  }
+
+  setStatus(elements.whatsappStatus, "Saving WhatsApp connector...");
+
+  try {
+    const response = await fetch("/api/config", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ whatsapp: whatsappPayload }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.details || payload.error || "Could not save WhatsApp settings.");
+    }
+
+    state.whatsappConfiguredModel = payload.whatsapp?.model || "";
+    elements.whatsappPhoneNumber.value =
+      payload.whatsapp?.phoneNumber || defaults.whatsappPhoneNumber;
+    elements.whatsappWebhookUrl.value =
+      payload.whatsapp?.webhookUrl || defaults.whatsappWebhookUrl;
+    elements.whatsappAuthToken.value = "";
+    elements.whatsappUseInternet.checked = Boolean(payload.whatsapp?.useInternet);
+    elements.whatsappAgentMode.checked = Boolean(payload.whatsapp?.agentMode);
+    elements.whatsappSystemPrompt.value =
+      payload.whatsapp?.systemPrompt || defaults.whatsappSystemPrompt;
+    populateWhatsAppModelOptions(state.models, state.models[0]?.id || "");
+    setStatus(
+      elements.whatsappStatus,
+      payload.whatsapp?.enabled
+        ? payload.whatsapp?.model
+          ? `Webhook ready with ${payload.whatsapp.model}`
+          : "Webhook ready, model will auto-select"
+        : "Saved, but the public webhook URL is still missing.",
+      !payload.whatsapp?.enabled
+    );
+    elements.whatsappNote.textContent = payload.whatsapp?.authTokenSet
+      ? "The Twilio auth token is write-only here. Leave it blank to keep signature verification enabled."
+      : "Add your Twilio auth token to verify webhook signatures. Point your Twilio WhatsApp webhook to /api/whatsapp on a public URL.";
+    saveSettings();
+  } catch (error) {
+    setStatus(elements.whatsappStatus, error.message, true);
+    elements.whatsappNote.textContent =
+      "Check the public webhook URL, optional Twilio auth token, and selected model, then save again.";
   }
 }
 
@@ -2348,13 +2965,13 @@ async function prepareSpeechText(text, requestId) {
 
     updateSpeechOutputStatus(
       payload.enhanced
-        ? `Browser playback + ${payload.model}`
-        : `Browser playback + ${payload.model} fallback`
+        ? `Speech polish: ${payload.model}. Playback: browser voice`
+        : `Speech polish: ${payload.model}. Playback: browser voice with original text`
     );
     return (payload.text || text).trim();
   } catch (error) {
     if (requestId === state.speechRequestId) {
-      updateSpeechOutputStatus("Browser playback only");
+      updateSpeechOutputStatus("Browser voice fallback for this reply");
     }
 
     return text;
@@ -2434,6 +3051,111 @@ async function speakText(text) {
   speakChunk(0);
 }
 
+function normalizeThinkingLevel(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  return /^(off|minimal|low|medium|high|xhigh)$/.test(normalized)
+    ? normalized
+    : "medium";
+}
+
+function normalizeUsageMode(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  return /^(off|tokens|full)$/.test(normalized) ? normalized : "off";
+}
+
+function getActiveConversationMessages() {
+  return state.messages.slice(state.contextStartIndex);
+}
+
+function getComposerHistoryEntries() {
+  return state.messages
+    .filter((message) => message.role === "user" && typeof message.content === "string")
+    .map((message) => message.content)
+    .filter(Boolean);
+}
+
+function moveComposerCaretToEnd() {
+  const valueLength = elements.messageInput.value.length;
+  elements.messageInput.focus();
+  elements.messageInput.setSelectionRange(valueLength, valueLength);
+}
+
+function resetComposerHistoryNavigation() {
+  state.composerHistoryIndex = -1;
+  state.composerDraft = "";
+}
+
+function handleComposerHistoryNavigation(event) {
+  if (document.activeElement !== elements.messageInput) {
+    return false;
+  }
+
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+    return false;
+  }
+
+  const history = getComposerHistoryEntries();
+  if (!history.length) {
+    return false;
+  }
+
+  const { selectionStart, selectionEnd, value } = elements.messageInput;
+  const caretAtStart = selectionStart === 0 && selectionEnd === 0;
+  const caretAtEnd = selectionStart === value.length && selectionEnd === value.length;
+
+  if (event.key === "ArrowUp") {
+    if (!caretAtStart) {
+      return false;
+    }
+
+    event.preventDefault();
+
+    if (state.composerHistoryIndex === -1) {
+      state.composerDraft = value;
+      state.composerHistoryIndex = history.length - 1;
+    } else if (state.composerHistoryIndex > 0) {
+      state.composerHistoryIndex -= 1;
+    }
+
+    elements.messageInput.value = history[state.composerHistoryIndex] || "";
+    moveComposerCaretToEnd();
+    return true;
+  }
+
+  if (event.key === "ArrowDown") {
+    if (state.composerHistoryIndex === -1 || !caretAtEnd) {
+      return false;
+    }
+
+    event.preventDefault();
+
+    if (state.composerHistoryIndex < history.length - 1) {
+      state.composerHistoryIndex += 1;
+      elements.messageInput.value = history[state.composerHistoryIndex] || "";
+    } else {
+      elements.messageInput.value = state.composerDraft || "";
+      resetComposerHistoryNavigation();
+    }
+
+    moveComposerCaretToEnd();
+    return true;
+  }
+
+  return false;
+}
+
+function buildCompactSummaryPromptPreview() {
+  return state.sessionSummary
+    ? `Compacted session summary:\n${state.sessionSummary}`
+    : "";
+}
+
 function buildMessages() {
   const messages = [];
   const systemPrompt = elements.systemPrompt.value.trim();
@@ -2442,13 +3164,178 @@ function buildMessages() {
     messages.push({ role: "system", content: systemPrompt });
   }
 
+  if (state.sessionSummary) {
+    messages.push({
+      role: "system",
+      content:
+        "Compacted conversation summary for continuity. Use it as context, but prioritize the latest turns.\n\n" +
+        state.sessionSummary,
+    });
+  }
+
   messages.push(
-    ...state.messages.map((message) => ({
+    ...getActiveConversationMessages().map((message) => ({
       role: message.role,
       content: message.content,
     }))
   );
   return messages;
+}
+
+function buildAssistantStatusText() {
+  const activeMessages = getActiveConversationMessages().length;
+  const pendingApprovals = state.agentActionQueue.filter(
+    (item) => item.status === "pending_approval"
+  ).length;
+
+  return [
+    `Model: ${elements.modelSelect.value || "Not selected"}`,
+    `Speech polish: ${elements.speechModelSelect.value || "Off"}`,
+    `Agent mode: ${elements.agentMode.checked ? "On" : "Off"}`,
+    `Internet: ${elements.useInternet.checked ? "On" : "Off"}`,
+    `Thinking level: ${state.thinkingLevel}`,
+    `Usage display: ${state.usageMode}`,
+    `Verbose trace: ${state.verboseAgentMode ? "On" : "Off"}`,
+    `Visible messages: ${state.messages.length}`,
+    `Active context messages: ${activeMessages}`,
+    `Compacted summary: ${state.sessionSummary ? "Present" : "None"}`,
+    `Pending approvals: ${pendingApprovals}`,
+  ].join("\n");
+}
+
+function appendAssistantMessage(content, options = {}) {
+  state.messages.push({
+    role: "assistant",
+    content,
+    sources: options.sources || [],
+    reasoningTrace: options.reasoningTrace || [],
+    usage: options.usage || null,
+  });
+  rerenderChat();
+}
+
+async function compactConversation({ force = false } = {}) {
+  const activeMessages = getActiveConversationMessages();
+  const shouldCompact =
+    activeMessages.length > AUTO_COMPACT_ACTIVE_MESSAGE_LIMIT ||
+    (force && activeMessages.length > 1);
+
+  if (!shouldCompact) {
+    return false;
+  }
+
+  const keepCount = force
+    ? Math.min(4, activeMessages.length)
+    : AUTO_COMPACT_KEEP_RECENT_MESSAGES;
+  const cutoffIndex = Math.max(state.contextStartIndex, state.messages.length - keepCount);
+  const messagesToCompact = state.messages.slice(state.contextStartIndex, cutoffIndex);
+
+  if (!messagesToCompact.length) {
+    return false;
+  }
+
+  const response = await fetch("/api/compact", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: elements.modelSelect.value,
+      summary: state.sessionSummary,
+      messages: messagesToCompact.map((message) => ({
+        role: message.role,
+        content: message.content,
+      })),
+    }),
+  });
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new Error(payload.details || payload.error || "Conversation compaction failed.");
+  }
+
+  state.sessionSummary = String(payload.summary || "").trim();
+  state.contextStartIndex = cutoffIndex;
+  saveSettings();
+  return true;
+}
+
+async function handleSlashCommand(commandText) {
+  const trimmed = String(commandText || "").trim();
+
+  if (!trimmed.startsWith("/")) {
+    return false;
+  }
+
+  const match = trimmed.match(/^\/(\S+)(?:\s+([\s\S]+))?$/);
+  const command = match?.[1]?.toLowerCase() || "";
+  const argument = match?.[2]?.trim() || "";
+
+  if (!command) {
+    return false;
+  }
+
+  if (command === "new" || command === "reset") {
+    state.messages = [];
+    state.sessionSummary = "";
+    state.contextStartIndex = 0;
+    clearAgentActionQueue();
+    rerenderChat();
+    elements.liveTranscript.textContent = "Started a fresh session.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "status") {
+    appendAssistantMessage(buildAssistantStatusText());
+    elements.liveTranscript.textContent = "Status ready.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "compact") {
+    if (!elements.modelSelect.value) {
+      throw new Error("Select a chat model first.");
+    }
+
+    const compacted = await compactConversation({ force: true });
+    appendAssistantMessage(
+      compacted
+        ? `I compacted the earlier conversation into hidden context so agent mode can stay focused.\n\n${buildCompactSummaryPromptPreview()}`
+        : "There was not enough conversation history to compact yet."
+    );
+    elements.liveTranscript.textContent = compacted ? "Conversation compacted." : "Nothing to compact.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "think") {
+    state.thinkingLevel = normalizeThinkingLevel(argument);
+    appendAssistantMessage(`Thinking level set to ${state.thinkingLevel}.`);
+    elements.liveTranscript.textContent = "Thinking level updated.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "usage") {
+    state.usageMode = normalizeUsageMode(argument);
+    rerenderChat();
+    appendAssistantMessage(`Usage display set to ${state.usageMode}.`);
+    elements.liveTranscript.textContent = "Usage display updated.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "verbose") {
+    state.verboseAgentMode = /^(on|true|yes)$/i.test(argument);
+    rerenderChat();
+    appendAssistantMessage(`Verbose agent trace ${state.verboseAgentMode ? "enabled" : "disabled"}.`);
+    elements.liveTranscript.textContent = "Verbose mode updated.";
+    saveSettings();
+    return true;
+  }
+
+  return false;
 }
 
 async function sendCurrentMessage() {
@@ -2457,6 +3344,22 @@ async function sendCurrentMessage() {
 
   if (!userText || state.isSending) {
     return;
+  }
+
+  if (userText.startsWith("/")) {
+    try {
+      const handled = await handleSlashCommand(userText);
+      if (handled) {
+        elements.messageInput.value = "";
+        resetComposerHistoryNavigation();
+        return;
+      }
+    } catch (error) {
+      appendAssistantMessage(`I couldn't run that command: ${error.message}`);
+      elements.liveTranscript.textContent = "Command failed.";
+      saveSettings();
+      return;
+    }
   }
 
   if (!scrapeRequest && !elements.modelSelect.value) {
@@ -2470,9 +3373,21 @@ async function sendCurrentMessage() {
   stopSpeaking();
   const visualExamples = scrapeRequest ? null : updateVisualExamples(userText);
 
+  if (!scrapeRequest) {
+    try {
+      const compacted = await compactConversation();
+      if (compacted) {
+        elements.liveTranscript.textContent = "Compacted earlier context, now continuing...";
+      }
+    } catch (error) {
+      appendAssistantMessage(`I couldn't compact the earlier conversation: ${error.message}`);
+    }
+  }
+
   state.messages.push({ role: "user", content: userText });
   rerenderChat();
   elements.messageInput.value = "";
+  resetComposerHistoryNavigation();
   elements.liveTranscript.textContent = scrapeRequest
     ? "Scraping the page and preparing JSON..."
     : elements.agentMode.checked
@@ -2507,6 +3422,8 @@ async function sendCurrentMessage() {
         agentMode: elements.agentMode.checked,
         temperature: Number(elements.temperature.value),
         maxTokens: Number(elements.maxTokens.value),
+        thinkingLevel: state.thinkingLevel,
+        verbose: state.verboseAgentMode,
       }),
     });
 
@@ -2523,6 +3440,7 @@ async function sendCurrentMessage() {
       content: assistantReply,
       sources: Array.isArray(payload.sources) ? payload.sources : [],
       reasoningTrace: Array.isArray(payload.reasoningTrace) ? payload.reasoningTrace : [],
+      usage: payload.usage || null,
     });
     rerenderChat();
     elements.liveTranscript.textContent = "Reply ready.";
@@ -2568,6 +3486,9 @@ function attachEvents() {
   elements.saveTranscription.addEventListener("click", () => {
     saveTranscriptionConfig().catch(() => {});
   });
+  elements.saveWhatsApp.addEventListener("click", () => {
+    saveWhatsAppConfig().catch(() => {});
+  });
   elements.refreshMics.addEventListener("click", refreshMicrophones);
   elements.startScreenTranscript.addEventListener("click", () => {
     startScreenTranscriptCapture().catch(() => {});
@@ -2590,10 +3511,85 @@ function attachEvents() {
     });
   });
   elements.clearAgentQueue.addEventListener("click", clearAgentActionQueue);
+  elements.botSelect.addEventListener("change", () => {
+    syncActiveBotFromControls();
+    state.activeBotId = elements.botSelect.value;
+    const nextBot = getActiveBot();
+    if (nextBot) {
+      applyBotToControls(nextBot, { persist: true });
+      setHelperText(elements.botStudioStatus, `Switched to "${nextBot.name}".`);
+    }
+  });
+  elements.newBot.addEventListener("click", () => {
+    syncActiveBotFromControls();
+    const nextBot = normalizeBotProfile({
+      id: createBotId(),
+      name: `Bot ${state.bots.length + 1}`,
+      description: "Custom voice-first assistant bot",
+      assistantName: `Bot ${state.bots.length + 1}`,
+      greeting: "",
+      systemPrompt: defaults.systemPrompt,
+      selectedModel: elements.modelSelect.value,
+      selectedSpeechModel: elements.speechModelSelect.value,
+      selectedVoice: elements.voiceSelect.value,
+      useInternet: elements.useInternet.checked,
+      agentMode: elements.agentMode.checked,
+      handsFree: elements.handsFree.checked,
+      autoSpeak: elements.autoSpeak.checked,
+      temperature: Number(elements.temperature.value),
+      maxTokens: Number(elements.maxTokens.value),
+    });
+    state.bots.push(nextBot);
+    applyBotToControls(nextBot, { persist: true });
+    setHelperText(elements.botStudioStatus, `Created a blank bot profile: "${nextBot.name}".`);
+  });
+  elements.saveBot.addEventListener("click", () => {
+    syncActiveBotFromControls();
+    refreshBotStudioFields();
+    saveSettings();
+    setHelperText(elements.botStudioStatus, `Saved "${getActiveBot()?.name || "bot"}".`);
+  });
+  elements.deleteBot.addEventListener("click", () => {
+    if (state.bots.length <= 1) {
+      setHelperText(elements.botStudioStatus, "Keep at least one bot profile in the workspace.", true);
+      return;
+    }
+
+    const deletingBot = getActiveBot();
+    state.bots = state.bots.filter((bot) => bot.id !== state.activeBotId);
+    state.activeBotId = state.bots[0]?.id || "";
+    const nextBot = getActiveBot();
+    refreshBotStudioFields();
+    if (nextBot) {
+      applyBotToControls(nextBot, { persist: true });
+    }
+    setHelperText(
+      elements.botStudioStatus,
+      deletingBot ? `Deleted "${deletingBot.name}".` : "Deleted the selected bot."
+    );
+  });
+  elements.recordBotPrompt.addEventListener("click", startBotPromptCapture);
+  elements.createBotFromPrompt.addEventListener("click", () => {
+    createBotFromPrompt().catch((error) => {
+      setHelperText(elements.botStudioStatus, error.message, true);
+    });
+  });
 
   elements.shortcutTiles.forEach((button) => {
     button.addEventListener("click", () => {
       const prompt = button.getAttribute("data-prompt") || "";
+      const botPrompt = button.getAttribute("data-bot-prompt") || "";
+
+      if (botPrompt && elements.botBuilderPrompt) {
+        elements.botBuilderPrompt.value = botPrompt;
+        elements.botBuilderPrompt.focus();
+        setHelperText(
+          elements.botStudioStatus,
+          "Bot prompt loaded. Review it, then click Create from prompt."
+        );
+        return;
+      }
+
       elements.messageInput.value = prompt;
       elements.messageInput.focus();
     });
@@ -2604,6 +3600,16 @@ function attachEvents() {
     rerenderChat();
     saveSettings();
   });
+
+  [elements.botName, elements.botDescription, elements.botGreeting, elements.botBuilderPrompt].forEach(
+    (element) => {
+      element.addEventListener("input", () => {
+        if (element !== elements.botBuilderPrompt) {
+          saveSettings();
+        }
+      });
+    }
+  );
 
   [
     elements.systemPrompt,
@@ -2621,6 +3627,12 @@ function attachEvents() {
     elements.transcriptionBaseUrl,
     elements.transcriptionModel,
     elements.transcriptionLanguage,
+    elements.whatsappPhoneNumber,
+    elements.whatsappWebhookUrl,
+    elements.whatsappModel,
+    elements.whatsappUseInternet,
+    elements.whatsappAgentMode,
+    elements.whatsappSystemPrompt,
     elements.screenCaptureSurface,
     elements.voiceSelect,
     elements.speechModelSelect,
@@ -2667,6 +3679,7 @@ function attachEvents() {
 
   elements.clearChat.addEventListener("click", () => {
     state.messages = [];
+    resetComposerHistoryNavigation();
     stopSpeaking();
     hideVisualExamples();
     elements.liveTranscript.textContent = "Start voice input or type a request below.";
@@ -2676,6 +3689,10 @@ function attachEvents() {
   elements.hideVisualScreen.addEventListener("click", hideVisualExamples);
 
   document.addEventListener("keydown", (event) => {
+    if (handleComposerHistoryNavigation(event)) {
+      return;
+    }
+
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       sendCurrentMessage();
     }
@@ -2699,6 +3716,16 @@ function applySettings() {
     settings.transcriptionModel || defaults.transcriptionModel;
   elements.transcriptionLanguage.value =
     settings.transcriptionLanguage || defaults.transcriptionLanguage;
+  elements.whatsappPhoneNumber.value =
+    settings.whatsappPhoneNumber || defaults.whatsappPhoneNumber;
+  elements.whatsappWebhookUrl.value =
+    settings.whatsappWebhookUrl || defaults.whatsappWebhookUrl;
+  elements.whatsappAuthToken.value = "";
+  elements.whatsappUseInternet.checked = Boolean(settings.whatsappUseInternet);
+  elements.whatsappAgentMode.checked = Boolean(settings.whatsappAgentMode);
+  elements.whatsappSystemPrompt.value =
+    settings.whatsappSystemPrompt || defaults.whatsappSystemPrompt;
+  state.whatsappConfiguredModel = settings.whatsappModel || "";
   elements.screenCaptureSurface.value =
     settings.screenCaptureSurface || defaults.screenCaptureSurface;
   elements.assistantName.value = settings.assistantName;
@@ -2709,8 +3736,14 @@ function applySettings() {
   elements.handsFree.checked = settings.handsFree;
   elements.temperature.value = String(settings.temperature);
   elements.maxTokens.value = String(settings.maxTokens);
+  state.thinkingLevel = normalizeThinkingLevel(settings.thinkingLevel);
+  state.usageMode = normalizeUsageMode(settings.usageMode);
+  state.verboseAgentMode = Boolean(settings.verboseAgentMode);
+  state.sessionSummary = typeof settings.sessionSummary === "string" ? settings.sessionSummary : "";
+  state.contextStartIndex = Math.max(0, Number(settings.contextStartIndex) || 0);
   state.pendingAgentApproval = settings.pendingAgentApproval || null;
   state.agentActionQueue = normalizeAgentActionQueue(settings.agentActionQueue);
+  ensureBotProfiles(settings);
   updateControlPanelVisibility(Boolean(settings.panelHidden));
   updateRangeLabels();
   updateHeroTitle();
@@ -2718,6 +3751,12 @@ function applySettings() {
   syncScreenTranscriptButtons();
   hideVisualExamples();
   renderAgentActionQueue();
+  refreshBotStudioFields();
+
+  const activeBot = getActiveBot();
+  if (activeBot) {
+    applyBotToControls(activeBot, { persist: false });
+  }
 }
 
 async function initialize() {

@@ -66,6 +66,7 @@ const elements = {
   micNote: document.querySelector("#mic-note"),
   micStatus: document.querySelector("#mic-status"),
   speechOutputStatus: document.querySelector("#speech-output-status"),
+  modelsInventory: document.querySelector("#models-inventory"),
   smtpStatus: document.querySelector("#smtp-status"),
   internetStatus: document.querySelector("#internet-status"),
   homeAssistantStatus: document.querySelector("#home-assistant-status"),
@@ -234,7 +235,7 @@ function updateSpeechOutputStatus(note = "") {
   if (selectedSpeechModel) {
     setStatus(
       elements.speechOutputStatus,
-      note || `Browser playback + ${selectedSpeechModel}`
+      note || `Speech polish: ${selectedSpeechModel}. Playback: browser voice`
     );
     return;
   }
@@ -349,6 +350,26 @@ function populateSpeechModelOptions(models, defaultSpeechModel) {
   updateSpeechOutputStatus();
 }
 
+function isSpeechPolishCapableModel(model) {
+  return model?.kind === "chat";
+}
+
+function updateModelsInventory(allModels) {
+  if (!elements.modelsInventory) {
+    return;
+  }
+
+  if (!Array.isArray(allModels) || !allModels.length) {
+    elements.modelsInventory.textContent = "LM Studio is reachable, but no models are currently loaded.";
+    return;
+  }
+
+  elements.modelsInventory.textContent =
+    `LM Studio loaded ${allModels.length} model${allModels.length === 1 ? "" : "s"}: ` +
+    allModels.map((model) => `${model.id} [${model.kind}]`).join(", ") +
+    ". Chat and speech-polish selectors show chat-compatible models only.";
+}
+
 async function loadModels() {
   setStatus(elements.connectionStatus, "Connecting...");
 
@@ -362,9 +383,10 @@ async function loadModels() {
 
     const allModels = payload.models || [];
     const chatModels = allModels.filter((model) => model.kind === "chat");
-    const speechModels = allModels.filter((model) => model.kind === "tts");
+    const speechModels = allModels.filter(isSpeechPolishCapableModel);
     state.models = chatModels;
     elements.modelSelect.innerHTML = "";
+    updateModelsInventory(allModels);
 
     if (!chatModels.length) {
       throw new Error("LM Studio is reachable, but no chat models are loaded.");
@@ -387,11 +409,14 @@ async function loadModels() {
 
     setStatus(
       elements.connectionStatus,
-      `Connected to ${payload.baseUrl} with ${chatModels.length} chat model${chatModels.length === 1 ? "" : "s"}`
+      `Connected to ${payload.baseUrl} with ${chatModels.length} chat-compatible model${chatModels.length === 1 ? "" : "s"} out of ${allModels.length} loaded`
     );
     saveSettings();
     return true;
   } catch (error) {
+    if (elements.modelsInventory) {
+      elements.modelsInventory.textContent = "Could not load the LM Studio model inventory.";
+    }
     setStatus(elements.connectionStatus, error.message, true);
     throw error;
   }
@@ -771,13 +796,13 @@ async function prepareSpeechText(text, requestId) {
 
     updateSpeechOutputStatus(
       payload.enhanced
-        ? `Browser playback + ${payload.model}`
-        : `Browser playback + ${payload.model} fallback`
+        ? `Speech polish: ${payload.model}. Playback: browser voice`
+        : `Speech polish: ${payload.model}. Playback: browser voice with original text`
     );
     return (payload.text || text).trim();
   } catch (error) {
     if (requestId === state.speechRequestId) {
-      updateSpeechOutputStatus("Browser playback only");
+      updateSpeechOutputStatus("Browser voice fallback for this reply");
     }
 
     return text;

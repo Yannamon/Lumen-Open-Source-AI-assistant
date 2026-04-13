@@ -10,6 +10,13 @@ import {
   type AgentToolName,
 } from "@/lib/agent-gateway";
 import { createMastraAgentOrchestrator } from "@/lib/agent-workflow";
+import {
+  appendWhatsAppConversation,
+  buildWhatsAppTwimlResponse,
+  loadWhatsAppConversation,
+  splitWhatsAppReply,
+  verifyTwilioSignature,
+} from "@/lib/whatsapp-channel";
 
 export type SearchSource = {
   title: string;
@@ -38,6 +45,8 @@ let agentGateway:
 
 const APP_ROOT = process.cwd();
 const DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234";
+const DEFAULT_ASSISTANT_SYSTEM_PROMPT =
+  "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.";
 let lmStudioBaseUrl = (
   process.env.LM_STUDIO_BASE_URL || DEFAULT_LM_STUDIO_BASE_URL
 ).replace(/\/+$/, "");
@@ -65,10 +74,25 @@ const transcriptionConfig = {
   model: process.env.TRANSCRIPTION_MODEL || DEFAULT_TRANSCRIPTION_MODEL,
   language: process.env.TRANSCRIPTION_LANGUAGE || "",
 };
+const whatsappConfig = {
+  provider: "Twilio",
+  phoneNumber:
+    process.env.WHATSAPP_PHONE_NUMBER ||
+    process.env.TWILIO_WHATSAPP_NUMBER ||
+    "",
+  webhookUrl: normalizeWebhookUrl(process.env.WHATSAPP_WEBHOOK_URL || ""),
+  authToken:
+    process.env.WHATSAPP_AUTH_TOKEN || process.env.TWILIO_AUTH_TOKEN || "",
+  model: process.env.WHATSAPP_MODEL || "",
+  useInternet: parseBooleanEnv(process.env.WHATSAPP_USE_INTERNET),
+  agentMode: parseBooleanEnv(process.env.WHATSAPP_AGENT_MODE),
+  systemPrompt:
+    process.env.WHATSAPP_SYSTEM_PROMPT || DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+};
 const INTERNET_SEARCH_PROVIDER = "DuckDuckGo";
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/";
-const DEFAULT_SPEECH_MODEL = "tts2-emo-qwen3-8b-192k";
+const DEFAULT_SPEECH_MODEL = process.env.SPEECH_MODEL || "";
 const SPOTIFY_WEB_URL = "https://open.spotify.com/";
 const RADIO_BROWSER_API_BASE_URL = "https://stations.radioss.app/json";
 const AGENT_LOOP_LIMIT = 4;
@@ -113,13 +137,74 @@ function buildInternetGroundingMessage(query, sources) {
   };
 }
 
-function buildAgentModeMessage(useInternet) {
+function normalizeThinkingLevel(value):
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh" {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (/^(off|minimal|low|medium|high|xhigh)$/.test(normalized)) {
+    return normalized as
+      | "off"
+      | "minimal"
+      | "low"
+      | "medium"
+      | "high"
+      | "xhigh";
+  }
+
+  return "medium";
+}
+
+function resolveAgentGenerationOptions(temperature, maxTokens, thinkingLevel) {
+  switch (normalizeThinkingLevel(thinkingLevel)) {
+    case "off":
+      return {
+        temperature: Math.min(0.2, temperature ?? 0.2),
+        maxTokens: Math.max(220, Math.min(maxTokens || 400, 320)),
+      };
+    case "minimal":
+      return {
+        temperature: Math.min(0.3, temperature ?? 0.3),
+        maxTokens: Math.max(260, Math.min(maxTokens || 400, 420)),
+      };
+    case "low":
+      return {
+        temperature: Math.min(0.45, temperature ?? 0.45),
+        maxTokens: Math.max(320, Math.min((maxTokens || 400) + 40, 520)),
+      };
+    case "high":
+      return {
+        temperature: Math.min(0.7, Math.max(0.2, temperature ?? 0.55)),
+        maxTokens: Math.max(520, (maxTokens || 400) + 180),
+      };
+    case "xhigh":
+      return {
+        temperature: Math.min(0.75, Math.max(0.2, temperature ?? 0.55)),
+        maxTokens: Math.max(700, (maxTokens || 400) + 320),
+      };
+    case "medium":
+    default:
+      return {
+        temperature,
+        maxTokens,
+      };
+  }
+}
+
+function buildAgentModeMessage(useInternet, thinkingLevel = "medium") {
   return {
     role: "system",
     content:
       "Agent mode is enabled. You may use available tools to gather information or take safe local actions before answering. " +
-      "Use tools instead of guessing when the task needs the current date or time, internet research, webpage extraction, Home Assistant, email, local computer control, memory, or structured output storage. " +
+      "Use tools instead of guessing when the task needs the current date or time, internet research, webpage extraction, Home Assistant, email, local computer control, memory, saved outputs, or structured output storage. " +
       "Only take actions that directly help with the user's request. Do not run arbitrary shell commands, automate external prompt windows, or take destructive actions. " +
+      `Requested thinking level: ${normalizeThinkingLevel(thinkingLevel)}. ` +
       `${useInternet ? "Internet search is available for this request. " : "Internet search is not enabled for this request. "}` +
       `${getAgentGateway().buildInjectedContext({ useInternet })} ` +
       "You may make multiple tool calls, then provide one concise final answer.",
@@ -183,6 +268,61 @@ function buildGrammarCheckMessages(text) {
     {
       role: "user",
       content: `Check and improve this writing:\n\n${text}`,
+    },
+  ];
+}
+
+function buildConversationCompactionMessages({ summary, messages }) {
+  const transcript = (Array.isArray(messages) ? messages : [])
+    .map((message) => `${String(message?.role || "user").toUpperCase()}: ${String(message?.content || "").trim()}`)
+    .filter((line) => !/: $/.test(line))
+    .join("\n\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You compact assistant conversations into a durable working summary. " +
+        "Preserve user preferences, commitments, unresolved tasks, relevant facts, and any outputs the assistant created. " +
+        "Do not repeat the whole transcript. Write a concise summary in plain text with short labeled sections if helpful. " +
+        "This summary will be injected as hidden context for future turns.",
+    },
+    {
+      role: "user",
+      content:
+        `Existing summary:\n${summary || "None yet."}\n\n` +
+        `Conversation to compact:\n${transcript || "No conversation provided."}`,
+    },
+  ];
+}
+
+function buildBotCreationMessages({
+  prompt,
+  availableModels,
+  currentAssistantName,
+  currentSystemPrompt,
+}) {
+  const modelCatalog = (Array.isArray(availableModels) ? availableModels : [])
+    .map((model) => `- ${String(model?.id || "").trim()} [${String(model?.kind || "chat").trim()}]`)
+    .filter(Boolean)
+    .join("\n");
+
+  return [
+    {
+      role: "system",
+      content:
+        "You create saved assistant bot profiles for a local voice-first AI app, inspired by Clawdbot's profile-oriented assistant workflow. " +
+        "Return exactly one JSON object and nothing else. " +
+        'Schema: {"name":"string","description":"string","assistantName":"string","greeting":"string","systemPrompt":"string","selectedModel":"string","selectedSpeechModel":"string","useInternet":true,"agentMode":false,"temperature":0.7,"maxTokens":400}. ' +
+        "Make the systemPrompt specific and useful, keep names short, preserve voice-friendly behavior, and prefer models from the provided catalog.",
+    },
+    {
+      role: "user",
+      content:
+        `Current assistant name: ${currentAssistantName || "Lumen"}\n` +
+        `Current system prompt: ${currentSystemPrompt || DEFAULT_ASSISTANT_SYSTEM_PROMPT}\n\n` +
+        `Available models:\n${modelCatalog || "- none provided"}\n\n` +
+        `Create a bot profile from this request:\n${prompt}`,
     },
   ];
 }
@@ -309,6 +449,14 @@ function normalizeBaseUrl(value) {
   return typeof value === "string" ? value.trim().replace(/\/+$/, "") : "";
 }
 
+function normalizeWebhookUrl(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseBooleanEnv(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || "").trim());
+}
+
 function looksLikeHtmlDocument(value) {
   const text = typeof value === "string" ? value.trim().slice(0, 200).toLowerCase() : "";
   return text.startsWith("<!doctype html") || text.startsWith("<html") || text.includes("<body");
@@ -411,6 +559,21 @@ function parseJsonObjectSafe(value) {
   }
 }
 
+function extractJsonObjectFromText(value) {
+  const text = typeof value === "string" ? stripReasoningBlocks(value) || value : "";
+
+  if (!text.trim()) {
+    return {};
+  }
+
+  try {
+    return parseJsonObject(text);
+  } catch {
+    const objectMatch = text.match(/\{[\s\S]*\}/);
+    return objectMatch?.[0] ? parseJsonObjectSafe(objectMatch[0]) : {};
+  }
+}
+
 function clipAgentTraceText(value, maxLength = 220) {
   const text = typeof value === "string" ? normalizeWhitespace(value) : "";
 
@@ -441,6 +604,12 @@ function getAgentTraceTitle(toolName) {
       return "Recalled memory";
     case "write_json_record":
       return "Saved structured output";
+    case "list_json_records":
+      return "Listed saved outputs";
+    case "read_json_record":
+      return "Read saved output";
+    case "get_session_snapshot":
+      return "Inspected session snapshot";
     default:
       return "Used an agent tool";
   }
@@ -486,6 +655,17 @@ function buildAgentTraceDetail(toolName, args, payload) {
     }
     case "write_json_record":
       return payload?.result || "Saved a structured JSON record to local output storage.";
+    case "list_json_records": {
+      const count = Array.isArray(payload?.records) ? payload.records.length : 0;
+      return payload?.result || `Listed ${count} saved JSON record${count === 1 ? "" : "s"}.`;
+    }
+    case "read_json_record":
+      return payload?.result || "Loaded a saved structured JSON record for reuse.";
+    case "get_session_snapshot":
+      return (
+        payload?.result ||
+        `Reviewed ${payload?.counts?.history || 0} history items, ${payload?.counts?.memories || 0} memories, and ${payload?.counts?.outputs || 0} saved outputs.`
+      );
     default:
       return payload?.result || payload?.message || "Completed a tool action.";
   }
@@ -2079,12 +2259,35 @@ function toUiModelList(payload) {
   }));
 }
 
+function isSpeechPolishCapableModel(model) {
+  return model?.kind === "chat";
+}
+
 function pickDefaultSpeechModel(models) {
+  const speechCandidates = models.filter(isSpeechPolishCapableModel);
   return (
-    models.find((model) => model.id === DEFAULT_SPEECH_MODEL)?.id ||
-    models.find((model) => model.kind === "tts")?.id ||
+    speechCandidates.find((model) => model.id === DEFAULT_SPEECH_MODEL)?.id ||
+    speechCandidates.find((model) => model.kind === "chat")?.id ||
+    speechCandidates[0]?.id ||
     null
   );
+}
+
+async function resolveSpeechPolishModel(requestedModel) {
+  const trimmedRequestedModel =
+    typeof requestedModel === "string" && requestedModel.trim() ? requestedModel.trim() : "";
+
+  if (trimmedRequestedModel) {
+    return trimmedRequestedModel;
+  }
+
+  try {
+    const payload = await fetchLmStudio("/v1/models");
+    const models = toUiModelList(payload);
+    return pickDefaultSpeechModel(models) || DEFAULT_SPEECH_MODEL;
+  } catch {
+    return DEFAULT_SPEECH_MODEL;
+  }
 }
 
 function pickDefaultChatModel(models) {
@@ -2820,6 +3023,54 @@ function writeAgentJsonRecord(kind, label, data) {
   };
 }
 
+function listAgentJsonRecords(kind = "", limit = 10) {
+  const records = getAgentGateway().listJsonRecords({
+    kind,
+    limit,
+  });
+
+  return {
+    result: records.length
+      ? `Found ${records.length} saved JSON record${records.length === 1 ? "" : "s"}.`
+      : "No saved JSON records matched that request.",
+    records,
+  };
+}
+
+function readAgentJsonRecord(input) {
+  const payload = getAgentGateway().readJsonRecord(input);
+
+  if (!payload) {
+    return {
+      result: "That saved JSON record could not be found.",
+      record: null,
+      data: null,
+      error: "That saved JSON record could not be found.",
+    };
+  }
+
+  return {
+    result: payload.error
+      ? payload.error
+      : `Loaded saved output "${payload.record.label}".`,
+    record: payload.record,
+    data: payload.data,
+    error: payload.error,
+  };
+}
+
+function getAgentSessionSnapshot(input = {}) {
+  const snapshot = getAgentGateway().getSessionSnapshot(input);
+
+  return {
+    result:
+      `Reviewed ${snapshot.counts.history} history entr${snapshot.counts.history === 1 ? "y" : "ies"}, ` +
+      `${snapshot.counts.memories} memor${snapshot.counts.memories === 1 ? "y" : "ies"}, and ` +
+      `${snapshot.counts.outputs} saved output${snapshot.counts.outputs === 1 ? "" : "s"}.`,
+    ...snapshot,
+  };
+}
+
 export async function postScrapeResult(body) {
   try {
     const requestedUrl = normalizeScrapeUrl(body?.url);
@@ -2912,16 +3163,84 @@ export async function getModelsResult() {
   }
 }
 
+export async function postBotCreateResult(body) {
+  try {
+    const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
+    const model = typeof body?.model === "string" ? body.model.trim() : "";
+    const currentAssistantName =
+      typeof body?.currentAssistantName === "string" ? body.currentAssistantName.trim() : "";
+    const currentSystemPrompt =
+      typeof body?.currentSystemPrompt === "string" ? body.currentSystemPrompt.trim() : "";
+    const availableModels = Array.isArray(body?.availableModels) ? body.availableModels : [];
+
+    if (!prompt) {
+      return createResult(400, { error: "A bot creation prompt is required." });
+    }
+
+    if (!model) {
+      return createResult(400, { error: "A chat model must be selected." });
+    }
+
+    const payload = await fetchLmStudio("/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model,
+        messages: buildBotCreationMessages({
+          prompt,
+          availableModels,
+          currentAssistantName,
+          currentSystemPrompt,
+        }),
+        temperature: 0.4,
+        max_tokens: 900,
+      }),
+    });
+
+    const content = getMessageTextContent(payload?.choices?.[0]?.message);
+
+    if (!content) {
+      return createResult(502, {
+        error: "LM Studio returned an empty bot profile response.",
+        raw: payload,
+      });
+    }
+
+    const bot = extractJsonObjectFromText(content);
+
+    if (!bot || typeof bot !== "object" || !String(bot.name || "").trim()) {
+      return createResult(502, {
+        error: "LM Studio returned an invalid bot profile.",
+        raw: stripReasoningBlocks(content) || content,
+      });
+    }
+
+    return createResult(200, {
+      bot,
+      usage: payload.usage || null,
+    });
+  } catch (error) {
+    return createResult(502, {
+      error: "Bot creation failed.",
+      details: error.message,
+    });
+  }
+}
+
 export async function postSpeakResult(body) {
   try {
     const text = typeof body.text === "string" ? body.text.trim() : "";
-    const model =
-      typeof body.model === "string" && body.model.trim()
-        ? body.model.trim()
-        : DEFAULT_SPEECH_MODEL;
+    const requestedModel =
+      typeof body.model === "string" && body.model.trim() ? body.model.trim() : "";
+    const model = await resolveSpeechPolishModel(requestedModel);
 
     if (!text) {
       return createResult(400, { error: "Speech text is required." });
+    }
+
+    if (!model) {
+      return createResult(503, {
+        error: "No speech polish model is available.",
+      });
     }
 
     const payload = await fetchLmStudio("/v1/chat/completions", {
@@ -2948,6 +3267,213 @@ export async function postSpeakResult(body) {
       details: error.message,
     });
   }
+}
+
+export async function postCompactResult(body) {
+  try {
+    const model = typeof body.model === "string" ? body.model.trim() : "";
+    const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+    const messages = Array.isArray(body.messages)
+      ? body.messages
+          .filter(
+            (message) =>
+              (message?.role === "user" || message?.role === "assistant") &&
+              typeof message?.content === "string" &&
+              message.content.trim()
+          )
+          .map((message) => ({
+            role: message.role,
+            content: message.content.trim(),
+          }))
+      : [];
+
+    if (!model) {
+      return createResult(400, { error: "A model must be selected." });
+    }
+
+    if (!summary && !messages.length) {
+      return createResult(400, { error: "A summary or at least one message is required." });
+    }
+
+    const payload = await fetchLmStudio("/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model,
+        messages: buildConversationCompactionMessages({ summary, messages }),
+        temperature: 0.2,
+        max_tokens: 500,
+      }),
+    });
+
+    const content = getMessageTextContent(payload?.choices?.[0]?.message);
+    if (!content) {
+      return createResult(502, {
+        error: "LM Studio returned an empty compaction response.",
+        raw: payload,
+      });
+    }
+
+    return createResult(200, {
+      summary: stripReasoningBlocks(content) || content,
+      usage: payload.usage || null,
+    });
+  } catch (error) {
+    return createResult(502, {
+      error: "Conversation compaction failed.",
+      details: error.message,
+    });
+  }
+}
+
+function getWhatsAppConfigSnapshot() {
+  return {
+    provider: whatsappConfig.provider,
+    phoneNumber: whatsappConfig.phoneNumber,
+    webhookUrl: whatsappConfig.webhookUrl,
+    authTokenSet: Boolean(whatsappConfig.authToken),
+    model: whatsappConfig.model,
+    useInternet: whatsappConfig.useInternet,
+    agentMode: whatsappConfig.agentMode,
+    systemPrompt: whatsappConfig.systemPrompt,
+    enabled: Boolean(whatsappConfig.webhookUrl),
+  };
+}
+
+async function resolveWhatsAppModel() {
+  if (whatsappConfig.model) {
+    return whatsappConfig.model;
+  }
+
+  const result = await getModelsResult();
+
+  if (result.status !== 200 || !result.body?.defaultModel) {
+    throw new Error(
+      result.body?.details ||
+        result.body?.error ||
+        "No chat model is available for WhatsApp yet."
+    );
+  }
+
+  return result.body.defaultModel;
+}
+
+type WhatsAppWebhookBody = {
+  requestUrl: string;
+  signature?: string;
+  fields?: Record<string, string | string[]>;
+};
+
+function coerceWhatsAppFieldValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry));
+  }
+
+  return typeof value === "string" ? value : "";
+}
+
+function getWhatsAppSingleField(value) {
+  if (Array.isArray(value)) {
+    return String(value[0] || "").trim();
+  }
+
+  return String(value || "").trim();
+}
+
+export async function postWhatsAppWebhookResult(body: WhatsAppWebhookBody) {
+  const fields = body?.fields && typeof body.fields === "object" ? body.fields : {};
+  const incomingText = getWhatsAppSingleField(fields.Body);
+  const sender = getWhatsAppSingleField(fields.From);
+  const requestSid = getWhatsAppSingleField(fields.MessageSid);
+  const signature = typeof body?.signature === "string" ? body.signature.trim() : "";
+  const signatureUrl = whatsappConfig.webhookUrl || normalizeWebhookUrl(body?.requestUrl || "");
+  const numMedia = Number(getWhatsAppSingleField(fields.NumMedia) || 0);
+
+  const replyWithXml = (message: string, status = 200) =>
+    createResult(status, {
+      xml: buildWhatsAppTwimlResponse(splitWhatsAppReply(message)),
+    });
+
+  if (signature && whatsappConfig.authToken) {
+    const isValidSignature = verifyTwilioSignature({
+      authToken: whatsappConfig.authToken,
+      signature,
+      url: signatureUrl,
+      params: Object.fromEntries(
+        Object.entries(fields).map(([key, value]) => [key, coerceWhatsAppFieldValue(value)])
+      ),
+    });
+
+    if (!isValidSignature) {
+      return replyWithXml("Webhook signature check failed.", 403);
+    }
+  }
+
+  if (!sender) {
+    return replyWithXml("The incoming WhatsApp message did not include a sender.", 400);
+  }
+
+  if (!incomingText) {
+    return replyWithXml(
+      numMedia > 0
+        ? "I received media, but this WhatsApp connector currently supports text messages only."
+        : "Send me a text message here and I will reply on WhatsApp.",
+      200
+    );
+  }
+
+  let model = "";
+
+  try {
+    model = await resolveWhatsAppModel();
+  } catch (error) {
+    return replyWithXml(
+      `WhatsApp is not ready yet: ${String(error?.message || "No chat model is configured.")}`
+    );
+  }
+
+  const historyMessages = loadWhatsAppConversation(APP_ROOT, sender, 12).map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
+  const systemPrompt = (whatsappConfig.systemPrompt || DEFAULT_ASSISTANT_SYSTEM_PROMPT).trim();
+  const messages = [
+    ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+    ...historyMessages,
+    { role: "user", content: incomingText },
+  ];
+
+  const result = await postChatResult({
+    model,
+    messages,
+    useInternet: whatsappConfig.useInternet,
+    agentMode: whatsappConfig.agentMode,
+    temperature: 0.7,
+    maxTokens: 500,
+  });
+
+  const replyText =
+    result.status === 200 &&
+    typeof result.body?.message === "string" &&
+    result.body.message.trim()
+      ? result.body.message.trim()
+      : `I couldn't complete that request: ${result.body?.details || result.body?.error || "Unknown error."}`;
+
+  appendWhatsAppConversation(APP_ROOT, sender, [
+    {
+      role: "user",
+      content: incomingText,
+      requestSid,
+    },
+    {
+      role: "assistant",
+      content: replyText,
+      requestSid,
+    },
+  ]);
+
+  return createResult(200, {
+    xml: buildWhatsAppTwimlResponse(splitWhatsAppReply(replyText)),
+  });
 }
 
 export async function postMediaTranscriptionResult(formData: FormData) {
@@ -3295,6 +3821,57 @@ async function executeAgentToolCall(toolCall, options) {
         sources: [],
       };
     }
+    case "list_json_records": {
+      const kind = typeof args.kind === "string" ? args.kind.trim() : "";
+      const limit = Math.max(1, Math.min(Number(args.limit) || 10, 20));
+      const records = listAgentJsonRecords(kind, limit);
+      return {
+        content: JSON.stringify({
+          ok: true,
+          kind,
+          result: records.result,
+          records: records.records,
+        }),
+        sources: [],
+      };
+    }
+    case "read_json_record": {
+      const payload = readAgentJsonRecord({
+        relativePath: typeof args.relativePath === "string" ? args.relativePath.trim() : "",
+        id: typeof args.id === "string" ? args.id.trim() : "",
+        label: typeof args.label === "string" ? args.label.trim() : "",
+      });
+
+      return {
+        content: JSON.stringify({
+          ok: !payload.error,
+          result: payload.result,
+          record: payload.record,
+          data: payload.data,
+          error: payload.error,
+        }),
+        sources: [],
+      };
+    }
+    case "get_session_snapshot": {
+      const snapshot = getAgentSessionSnapshot({
+        historyLimit: Math.max(1, Math.min(Number(args.historyLimit) || 6, 12)),
+        memoryLimit: Math.max(1, Math.min(Number(args.memoryLimit) || 5, 10)),
+        outputLimit: Math.max(1, Math.min(Number(args.outputLimit) || 5, 10)),
+      });
+
+      return {
+        content: JSON.stringify({
+          ok: true,
+          result: snapshot.result,
+          history: snapshot.history,
+          memories: snapshot.memories,
+          outputs: snapshot.outputs,
+          counts: snapshot.counts,
+        }),
+        sources: [],
+      };
+    }
     default:
       return {
         content: JSON.stringify({
@@ -3403,6 +3980,9 @@ function getMastraAgentOrchestrator() {
       rememberMemory: rememberAgentMemory,
       recallMemory: recallAgentMemories,
       writeJsonRecord: writeAgentJsonRecord,
+      listJsonRecords: ({ kind, limit }) => getAgentGateway().listJsonRecords({ kind, limit }),
+      readJsonRecord: (input) => getAgentGateway().readJsonRecord(input),
+      getSessionSnapshot: (input) => getAgentGateway().getSessionSnapshot(input),
       gateway: getAgentGateway(),
     });
   }
@@ -3533,6 +4113,7 @@ export function getConfigResult() {
       apiKeySet: Boolean(transcriptionConfig.apiKey),
       enabled: Boolean(transcriptionConfig.baseUrl && transcriptionConfig.model),
     },
+    whatsapp: getWhatsAppConfigSnapshot(),
   });
 }
 
@@ -3549,6 +4130,8 @@ export async function postConfigResult(body) {
       body?.transcription && typeof body.transcription === "object"
         ? body.transcription
         : undefined;
+    const whatsapp =
+      body?.whatsapp && typeof body.whatsapp === "object" ? body.whatsapp : undefined;
 
     if (baseUrl !== undefined) {
       lmStudioBaseUrl = (baseUrl || DEFAULT_LM_STUDIO_BASE_URL).replace(/\/+$/, "");
@@ -3646,6 +4229,50 @@ export async function postConfigResult(body) {
       }
     }
 
+    if (whatsapp) {
+      const nextPhoneNumber =
+        typeof whatsapp.phoneNumber === "string"
+          ? whatsapp.phoneNumber.trim()
+          : whatsappConfig.phoneNumber;
+      const nextWebhookUrl =
+        typeof whatsapp.webhookUrl === "string"
+          ? normalizeWebhookUrl(whatsapp.webhookUrl)
+          : whatsappConfig.webhookUrl;
+      const nextAuthToken =
+        typeof whatsapp.authToken === "string" ? whatsapp.authToken.trim() : undefined;
+      const nextModel =
+        typeof whatsapp.model === "string" ? whatsapp.model.trim() : whatsappConfig.model;
+      const nextUseInternet =
+        typeof whatsapp.useInternet === "boolean"
+          ? whatsapp.useInternet
+          : whatsappConfig.useInternet;
+      const nextAgentMode =
+        typeof whatsapp.agentMode === "boolean"
+          ? whatsapp.agentMode
+          : whatsappConfig.agentMode;
+      const nextSystemPrompt =
+        typeof whatsapp.systemPrompt === "string" && whatsapp.systemPrompt.trim()
+          ? whatsapp.systemPrompt.trim()
+          : whatsappConfig.systemPrompt || DEFAULT_ASSISTANT_SYSTEM_PROMPT;
+
+      if (nextWebhookUrl && !/^https?:\/\//i.test(nextWebhookUrl)) {
+        return createResult(400, {
+          error: "WhatsApp webhook URL must start with http:// or https://.",
+        });
+      }
+
+      whatsappConfig.phoneNumber = nextPhoneNumber;
+      whatsappConfig.webhookUrl = nextWebhookUrl;
+      whatsappConfig.model = nextModel;
+      whatsappConfig.useInternet = nextUseInternet;
+      whatsappConfig.agentMode = nextAgentMode;
+      whatsappConfig.systemPrompt = nextSystemPrompt;
+
+      if (nextAuthToken !== undefined) {
+        whatsappConfig.authToken = nextAuthToken;
+      }
+    }
+
     return createResult(200, {
       baseUrl: lmStudioBaseUrl,
       smtp: {
@@ -3668,6 +4295,7 @@ export async function postConfigResult(body) {
         apiKeySet: Boolean(transcriptionConfig.apiKey),
         enabled: Boolean(transcriptionConfig.baseUrl && transcriptionConfig.model),
       },
+      whatsapp: getWhatsAppConfigSnapshot(),
     });
   } catch (error) {
     return createResult(400, {
@@ -3717,6 +4345,8 @@ export async function postChatResult(body) {
       typeof body.temperature === "number" ? body.temperature : 0.7;
     const maxTokens =
       typeof body.maxTokens === "number" ? body.maxTokens : 400;
+    const thinkingLevel = normalizeThinkingLevel(body.thinkingLevel);
+    const verbose = body.verbose === true;
 
     if (!model) {
       return createResult(400, { error: "A model must be selected." });
@@ -3765,13 +4395,21 @@ export async function postChatResult(body) {
     }
 
     if (agentMode) {
+      const resolvedAgentOptions = resolveAgentGenerationOptions(
+        temperature,
+        maxTokens,
+        thinkingLevel
+      );
+
       try {
         const response = await getMastraAgentOrchestrator().start({
           model,
           messages,
           useInternet,
-          temperature,
-          maxTokens,
+          temperature: resolvedAgentOptions.temperature,
+          maxTokens: resolvedAgentOptions.maxTokens,
+          thinkingLevel,
+          verbose,
         });
 
         return createResult(200, response);

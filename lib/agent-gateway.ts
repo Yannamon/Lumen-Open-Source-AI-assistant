@@ -14,6 +14,9 @@ export const AGENT_TOOL_NAME_VALUES = [
   "remember_memory",
   "recall_memory",
   "write_json_record",
+  "list_json_records",
+  "read_json_record",
+  "get_session_snapshot",
 ] as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAME_VALUES)[number];
@@ -47,6 +50,10 @@ export type AgentOutputRecord = {
   label: string;
   relativePath: string;
   createdAt: string;
+};
+
+type StoredAgentOutputRecord = AgentOutputRecord & {
+  size?: number;
 };
 
 const TOOL_SCHEMAS: AgentToolSchemaDefinition[] = [
@@ -214,6 +221,71 @@ const TOOL_SCHEMAS: AgentToolSchemaDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "list_json_records",
+    description:
+      "List recently saved local JSON artifacts so the agent can reuse prior structured outputs.",
+    parameters: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          description: "Optional kind filter such as plan, research, output, or report.",
+        },
+        limit: {
+          type: "number",
+          description: "Optional maximum number of records to return.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "read_json_record",
+    description:
+      "Read a previously saved local JSON artifact by relative path, id, or label so the agent can continue prior work.",
+    parameters: {
+      type: "object",
+      properties: {
+        relativePath: {
+          type: "string",
+          description: "Preferred relative path from .lumen-agent/outputs, if known.",
+        },
+        id: {
+          type: "string",
+          description: "Optional saved record id.",
+        },
+        label: {
+          type: "string",
+          description: "Optional human-readable label to match.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_session_snapshot",
+    description:
+      "Inspect recent agent history, memory, and saved outputs for continuity before taking the next step.",
+    parameters: {
+      type: "object",
+      properties: {
+        historyLimit: {
+          type: "number",
+          description: "Optional maximum number of recent history items.",
+        },
+        memoryLimit: {
+          type: "number",
+          description: "Optional maximum number of recent memory items.",
+        },
+        outputLimit: {
+          type: "number",
+          description: "Optional maximum number of recent saved outputs.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function ensureDirectory(directoryPath: string) {
@@ -317,6 +389,13 @@ export function createAgentGateway(appRoot: string) {
     return entries.slice(-limit);
   }
 
+  function getPromptHistory(limit = 10) {
+    const entries = readJsonlEntries<AgentHistoryEntry>(historyPath);
+    return entries
+      .filter((entry) => entry?.stage !== "summary")
+      .slice(-limit);
+  }
+
   function rememberMemory(input: {
     text: string;
     tags?: string[];
@@ -388,6 +467,86 @@ export function createAgentGateway(appRoot: string) {
     return record;
   }
 
+  function listJsonRecords(input: { kind?: string; limit?: number } = {}) {
+    const normalizedKind = String(input.kind || "")
+      .trim()
+      .toLowerCase();
+    const normalizedLimit = Math.max(1, Math.min(Number(input.limit) || 10, 20));
+
+    return readJsonlEntries<StoredAgentOutputRecord>(outputsIndexPath)
+      .filter((entry) => !normalizedKind || entry.kind === normalizedKind)
+      .slice(-normalizedLimit)
+      .reverse();
+  }
+
+  function readJsonRecord(input: {
+    relativePath?: string;
+    id?: string;
+    label?: string;
+  }) {
+    const relativePath = String(input.relativePath || "")
+      .trim()
+      .replace(/\\/g, "/");
+    const id = String(input.id || "").trim();
+    const label = String(input.label || "")
+      .trim()
+      .toLowerCase();
+    const entries = readJsonlEntries<StoredAgentOutputRecord>(outputsIndexPath);
+    const record =
+      entries.find((entry) => relativePath && entry.relativePath === relativePath) ||
+      entries.find((entry) => id && entry.id === id) ||
+      entries.find((entry) => label && entry.label.toLowerCase() === label) ||
+      null;
+
+    if (!record) {
+      return null;
+    }
+
+    const filePath = path.join(appRoot, record.relativePath);
+    if (!fs.existsSync(filePath)) {
+      return {
+        record,
+        data: null,
+        error: `The saved file for ${record.label} is no longer available.`,
+      };
+    }
+
+    try {
+      return {
+        record,
+        data: JSON.parse(fs.readFileSync(filePath, "utf8")),
+        error: null,
+      };
+    } catch (error: any) {
+      return {
+        record,
+        data: null,
+        error: error?.message || "The saved JSON record could not be parsed.",
+      };
+    }
+  }
+
+  function getSessionSnapshot(input: {
+    historyLimit?: number;
+    memoryLimit?: number;
+    outputLimit?: number;
+  } = {}) {
+    const history = getPromptHistory(input.historyLimit || 6);
+    const memories = recallMemory("", input.memoryLimit || 5);
+    const outputs = listJsonRecords({ limit: input.outputLimit || 5 });
+
+    return {
+      history,
+      memories,
+      outputs,
+      counts: {
+        history: history.length,
+        memories: memories.length,
+        outputs: outputs.length,
+      },
+    };
+  }
+
   function buildInjectedContext(input: {
     systemPrompt?: string;
     trigger?: string;
@@ -395,7 +554,7 @@ export function createAgentGateway(appRoot: string) {
     historyLimit?: number;
     memoryLimit?: number;
   }) {
-    const recentHistory = getRecentHistory(input.historyLimit || 8);
+    const recentHistory = getPromptHistory(input.historyLimit || 8);
     const recentMemories = recallMemory("", input.memoryLimit || 5);
     const toolSummary = getToolSchemas()
       .map((tool) => `- ${tool.name}: ${tool.description}`)
@@ -431,7 +590,7 @@ export function createAgentGateway(appRoot: string) {
       `Internet enabled: ${input.useInternet ? "yes" : "no"}`,
       input.systemPrompt ? `System prompt:\n${input.systemPrompt}` : "System prompt:\n<none provided>",
       `Tool schemas:\n${toolSummary}`,
-      `Recent JSONL history:\n${historySummary}`,
+      `Recent agent history, excluding final replies:\n${historySummary}`,
       `Recent memory entries:\n${memorySummary}`,
       "Outputs can be persisted through write_json_record and memory can be updated through remember_memory.",
     ].join("\n\n");
@@ -451,6 +610,9 @@ export function createAgentGateway(appRoot: string) {
     rememberMemory,
     recallMemory,
     writeJsonRecord,
+    listJsonRecords,
+    readJsonRecord,
+    getSessionSnapshot,
     buildInjectedContext,
   };
 }

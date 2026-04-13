@@ -13,6 +13,7 @@ A Next.js + TypeScript local voice-enabled assistant that runs in your browser a
 - Speaks assistant replies aloud with browser text-to-speech
 - Lets you tune the assistant name, system prompt, model, temperature, and reply length
 - Includes an optional Agent mode for multi-step tasks using built-in tools like internet search, email, system info, and local app controls
+- Adds OpenClaw-inspired session controls such as conversation compaction, slash commands, thinking levels, and usage display
 - Hides raw chain-of-thought style output and returns clean final answers, including stripping `<think>` blocks from models that emit them
 - Includes quick actions for grammar checking and Microsoft Lists guidance
 - Can capture a shared browser tab or screen audio feed and transcribe it through LocalAI or another OpenAI-compatible transcription API
@@ -28,6 +29,9 @@ Built-in agent tools:
 - `Computer control`: opens supported local apps, controls Spotify playback, opens VS Code, and reads system, CPU, or memory status
 - `Home Assistant`: checks entity state, lists supported domains, calls services, and can search or play radio stations through Home Assistant
 - `Email`: sends through configured SMTP or opens a local draft
+- `Memory`: stores and recalls durable notes between runs
+- `Saved outputs`: writes, lists, and reopens structured JSON artifacts so longer workflows can pick up previous work
+- `Session snapshot`: inspects recent history, memory, and saved outputs for continuity before planning the next step
 
 Examples of tasks Agent mode can handle well:
 
@@ -48,6 +52,16 @@ Agent mode guardrails:
 - It does not automate Codex window pasting or submission from within agent mode
 - If the task needs the web, `Use internet for grounded answers` should also be enabled
 
+OpenClaw-inspired runtime controls:
+
+- Automatic session compaction prunes older turns into a hidden summary so long-running agent chats stay focused
+- `/compact` forces an immediate conversation compaction pass
+- `/status` shows the current model, reasoning settings, queue state, and summary status
+- `/think off|minimal|low|medium|high|xhigh` adjusts how much planning depth agent mode uses
+- `/usage off|tokens|full` controls whether model token usage is shown below assistant replies
+- `/verbose on|off` controls whether agent traces open expanded in the chat UI
+- `/new` or `/reset` starts a fresh session and clears compacted context
+
 ## Reasoning
 
 This project already includes a lightweight reasoning workflow aimed at practical local assistant tasks rather than exposing a long visible "thinking" transcript.
@@ -61,6 +75,7 @@ Current reasoning-related features:
 - `Time-aware reasoning`: the app injects the exact local date, time, and timezone into the prompt so "today", "tomorrow", and "what time is it" requests do not depend on model guesses
 - `Clean final-answer mode`: the assistant instructs the model not to expose hidden chain-of-thought, and the app strips `<think>...</think>` blocks before showing or speaking a reply
 - `Voice-safe output`: replies can be post-processed for speech so the spoken answer stays natural and concise instead of reading internal reasoning aloud
+- `Speech polish stays chat-based`: the speech-polish pass uses chat/instruct models, while the browser still provides the final playback voice
 - `Reasoning-model compatible`: you can still point the UI at reasoning-capable models in LM Studio, but the default model picker intentionally favors chat/instruct models for faster voice-first interaction
 
 Open-source references that informed this section:

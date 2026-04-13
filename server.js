@@ -21,7 +21,7 @@ const smtpConfig = {
 const INTERNET_SEARCH_PROVIDER = "DuckDuckGo";
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/";
-const DEFAULT_SPEECH_MODEL = "tts2-emo-qwen3-8b-192k";
+const DEFAULT_SPEECH_MODEL = process.env.SPEECH_MODEL || "";
 const SPOTIFY_WEB_URL = "https://open.spotify.com/";
 const AGENT_LOOP_LIMIT = 4;
 const AGENT_TOOL_CALL_LIMIT = 4;
@@ -1750,10 +1750,16 @@ function toUiModelList(payload) {
   }));
 }
 
+function isSpeechPolishCapableModel(model) {
+  return model?.kind === "chat";
+}
+
 function pickDefaultSpeechModel(models) {
+  const speechCandidates = models.filter(isSpeechPolishCapableModel);
   return (
-    models.find((model) => model.id === DEFAULT_SPEECH_MODEL)?.id ||
-    models.find((model) => model.kind === "tts")?.id ||
+    speechCandidates.find((model) => model.id === DEFAULT_SPEECH_MODEL)?.id ||
+    speechCandidates.find((model) => model.kind === "chat")?.id ||
+    speechCandidates[0]?.id ||
     null
   );
 }
@@ -1975,6 +1981,11 @@ async function handleSpeak(request, response) {
 
     if (!text) {
       sendJson(response, 400, { error: "Speech text is required." });
+      return;
+    }
+
+    if (!model) {
+      sendJson(response, 503, { error: "No speech polish model is available." });
       return;
     }
 
