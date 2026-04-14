@@ -296,6 +296,16 @@ const pageMarkup = `
             <p class="lead">Compact Mac-style controls</p>
           </div>
 
+          <section class="live-card inspector-card">
+            <div class="section-head">
+              <h3>Live transcript</h3>
+              <span id="listening-indicator" class="badge">Idle</span>
+            </div>
+            <p id="live-transcript" class="live-transcript">
+              Start voice input or type a request below.
+            </p>
+          </section>
+
           <section class="panel-card inspector-card model-controls-card">
             <div class="section-head">
               <div>
@@ -431,24 +441,30 @@ const pageMarkup = `
               <button id="create-bot-from-prompt" class="ghost-button" type="button">Create from prompt</button>
             </div>
 
-            <p id="bot-studio-status" class="helper-text">
-              Build bots from typed or spoken prompts, then switch between them instantly.
-            </p>
-          </section>
+            <section class="clawd-skill-library">
+              <div class="section-head">
+                <div>
+                  <h3>ClawdHub-style skill packs</h3>
+                  <p class="helper-text">
+                    Instant bot presets inspired by clawdbot workflows, voice-first routing, and showcase builds.
+                  </p>
+                </div>
+              </div>
+              <div id="clawd-skill-grid" class="shortcut-grid clawd-skill-grid"></div>
+            </section>
 
-          <section class="live-card inspector-card">
-            <div class="section-head">
-              <h3>Live transcript</h3>
-              <span id="listening-indicator" class="badge">Idle</span>
-            </div>
-            <p id="live-transcript" class="live-transcript">
-              Start voice input or type a request below.
+            <p id="bot-studio-status" class="helper-text">
+              Build bots from typed or spoken prompts, or install a Clawdbot-style skill pack and switch instantly.
             </p>
           </section>
 
           <section class="panel-card behaviors-card">
             <h3>Behaviors</h3>
             <div class="toggle-grid inspector-toggle-grid">
+              <label class="toggle">
+                <span>Clap or "Talk to me"</span>
+                <input id="clap-wake" type="checkbox" checked />
+              </label>
               <label class="toggle">
                 <span>Hands-free follow-up</span>
                 <input id="hands-free" type="checkbox" />
@@ -466,6 +482,9 @@ const pageMarkup = `
                 <input id="agent-mode" type="checkbox" />
               </label>
             </div>
+            <p id="clap-wake-note" class="helper-text">
+              Clap once or say "Talk to me" to start the conversation.
+            </p>
           </section>
 
           <section class="panel-card status-card">

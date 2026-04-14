@@ -2626,6 +2626,22 @@ dt {
   resize: vertical;
 }
 
+.clawd-skill-library {
+  display: grid;
+  gap: 12px;
+}
+
+.clawd-skill-grid {
+  max-height: none;
+  overflow: visible;
+  grid-auto-rows: minmax(112px, auto);
+}
+
+.clawd-skill-tile {
+  min-height: 0;
+  text-align: left;
+}
+
 .prompt-card textarea {
   min-height: 180px;
   resize: vertical;

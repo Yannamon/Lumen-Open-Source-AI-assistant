@@ -1,17 +1,43 @@
-lumen-Open-Source-AI-assistant
+<table align="center">
+  <tr>
+    <td align="center">
+      <h1>lumen-Open-Source-AI-assistant</h1>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="public/readme/lumen-hero.png" alt="Lumen friendly AI assistant with glowing orb" width="900" />
+</p>
+
 Local voice-first personal assistant built with Next.js and LM Studio, featuring chat, browser speech playback, microphone input, screen-audio transcription, internet-grounded answers, and optional Home Assistant/SMTP integrations.
 
 # Personal Voice Assistant
 
 A Next.js + TypeScript local voice-enabled assistant that runs in your browser and uses your LM Studio server as the model backend.
 
+## Before you start
+
+1. If Node.js is not installed, download and install it first from the official Node.js website.
+2. Use Node.js `22` or newer for this project.
+3. After installing Node.js, open a new terminal so `node` and `npm` are available.
+4. Check that it worked:
+
+```powershell
+node -v
+npm -v
+```
+
 ## What it does
 
 - Serves a local Next.js web app at `http://localhost:3000`
 - Detects available chat models from your LM Studio server at `http://yourip:1234`
 - Accepts typed prompts or microphone input in the browser
+- Supports wake-up listening by clap or by saying `Talk to me`
 - Speaks assistant replies aloud with browser text-to-speech
+- Shows a live transcript panel in the Inspector so voice state is always visible
 - Lets you tune the assistant name, system prompt, model, temperature, and reply length
+- Includes a Clawdbot-inspired Bot Studio with reusable skill-pack presets for research, home ops, memory, travel, inbox triage, and voice concierge flows
 - Includes an optional Agent mode for multi-step tasks using built-in tools like internet search, email, system info, and local app controls
 - Adds OpenClaw-inspired session controls such as conversation compaction, slash commands, thinking levels, and usage display
 - Hides raw chain-of-thought style output and returns clean final answers, including stripping `<think>` blocks from models that emit them
@@ -59,8 +85,19 @@ OpenClaw-inspired runtime controls:
 - `/status` shows the current model, reasoning settings, queue state, and summary status
 - `/think off|minimal|low|medium|high|xhigh` adjusts how much planning depth agent mode uses
 - `/usage off|tokens|full` controls whether model token usage is shown below assistant replies
+- `/cost on|off` toggles Clawdbot-style token and cost lines below assistant replies
 - `/verbose on|off` controls whether agent traces open expanded in the chat UI
+- `/skills` lists the built-in ClawdHub-style skill packs available in Bot Studio
+- `/skill <name>` installs one of the built-in ClawdHub-style skill packs as a new bot profile
 - `/new` or `/reset` starts a fresh session and clears compacted context
+
+## Voice wake and Bot Studio
+
+- Turn on wake listening and start a conversation either by clapping once near the microphone or by saying `Talk to me`
+- The `Live transcript` card in the Inspector shows the current listening state and transcript updates in real time
+- Bot Studio now includes ClawdHub-style skill packs you can install instantly as reusable bot profiles
+- Built-in packs include voice concierge, research scout, home ops, memory vault, inbox captain, and travel dispatch
+- You can still create custom bots from typed prompts or recorded voice prompts
 
 ## Reasoning
 
@@ -87,8 +124,9 @@ If you want to evolve this project further, those repos are good references for 
 
 ## Run it
 
-1. Open LM Studio, go to `Developer`, and turn on the `Developer Server` so the local server is running on `http://yourip:1234`
-2. From this folder, run:
+1. If Node.js is not installed yet, install Node.js first, then reopen your terminal.
+2. Open LM Studio, go to `Developer`, and turn on the `Developer Server` so the local server is running on `http://yourip:1234`
+3. From this folder, run:
 
 ```powershell
 npm install
@@ -96,9 +134,9 @@ npm run build
 npm run dev
 ```
 
-3. Open `http://localhost:3000` in Chrome or Edge
+4. Open `http://localhost:3000` in Chrome or Edge
 
-4. Optional for `Screen transcript`: run LocalAI locally on `http://127.0.0.1:8080` and load a Whisper model such as `whisper-1`
+5. Optional for `Screen transcript`: run LocalAI locally on `http://127.0.0.1:8080` and load a Whisper model such as `whisper-1`
 
 `npm run dev` uses a small in-process launcher for Next.js dev mode so Windows setups that hit `spawn EPERM` can still start cleanly. `npm run dev:next` now points to the same safe launcher so the Windows `spawn EPERM` path does not come back by accident.
 
@@ -135,6 +173,7 @@ If LM Studio is running on the same Windows machine as Docker Desktop, `host.doc
 
 - Speech recognition uses the browser Web Speech API, so Chrome or Edge will work best.
 - Use `http://localhost:3000` on the same computer for microphone access. Opening the app from a plain file path or some non-localhost HTTP addresses can block browser speech features.
+- Wake listening can start the conversation either from a clap or the phrase `Talk to me`.
 - If you want a different backend URL, set `LM_STUDIO_BASE_URL` before starting Next.js.
 - Screen or tab transcription now defaults to LocalAI at `http://127.0.0.1:8080/v1` with model `whisper-1`.
 - If your LocalAI setup does not require auth, you can leave the transcription API key blank.
@@ -142,6 +181,7 @@ If LM Studio is running on the same Windows machine as Docker Desktop, `host.doc
 - Internet search is available through DuckDuckGo on the server side, with no browser-exposed API key needed.
 - Turn on `Use internet for grounded answers` in the UI to search the web and return clickable source links.
 - Turn on `Agent mode for multi-step tasks` in the UI if you want the assistant to decide when to use its built-in tools before answering. Agent mode can check time, search the web, control a limited set of local actions, talk to Home Assistant, and send or draft email, but it does not run arbitrary shell commands on its own.
+- Use Bot Studio to install the built-in ClawdHub-style skill packs or create your own reusable assistant profiles.
 - Use the `Grammar check` quick action or start a message with `Grammar check:` to get a corrected version plus key improvements.
 - Use the `Microsoft Lists` quick action to get practical ideas for templates, conditional formatting, and Microsoft 365 integrations.
 - Home Assistant is supported through its official REST API. Save your Home Assistant base URL and a long-lived access token in the UI to enable it.

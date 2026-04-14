@@ -30,6 +30,7 @@ const defaults = {
   whatsappSystemPrompt: DEFAULT_ASSISTANT_PROMPT,
   useInternet: false,
   agentMode: false,
+  clapWake: true,
   assistantName: "Lumen",
   systemPrompt: DEFAULT_ASSISTANT_PROMPT,
   autoSpeak: true,
@@ -54,6 +55,123 @@ const SCREEN_TRANSCRIPT_CHUNK_MS = 20000;
 const SCREEN_TRANSCRIPT_PROMPT_TAIL_LENGTH = 600;
 const AUTO_COMPACT_ACTIVE_MESSAGE_LIMIT = 12;
 const AUTO_COMPACT_KEEP_RECENT_MESSAGES = 6;
+const WAKE_PHRASE_PATTERN = /\btalk to me\b/i;
+const CLAWD_SKILL_TEMPLATES = [
+  {
+    id: "voice-concierge",
+    kicker: "Voice Wake",
+    name: "Voice Concierge",
+    description: "Always-on voice-first companion for quick questions, dictation, and follow-up turns.",
+    note: "Hands-free, concise, and natural to speak with.",
+    assistantName: "Clawd Concierge",
+    greeting: "Voice concierge ready. Say what you need and I will keep the thread moving.",
+    systemPrompt:
+      "You are a fast, warm, voice-first personal concierge inspired by Clawdbot. Keep replies concise, practical, and easy to hear aloud. Ask only the minimum follow-up needed, suggest the next action, and maintain conversational momentum.",
+    useInternet: true,
+    agentMode: true,
+    handsFree: true,
+    autoSpeak: true,
+    temperature: 0.6,
+    maxTokens: 350,
+    builderPrompt:
+      "Create a voice-first concierge bot inspired by Clawdbot that answers quickly, keeps a natural spoken rhythm, and smoothly handles follow-up requests."
+  },
+  {
+    id: "research-scout",
+    kicker: "Web + Sources",
+    name: "Research Scout",
+    description: "Grounded internet research with source-first summaries and action-oriented next steps.",
+    note: "Best for comparison, news, planning, and fact checking.",
+    assistantName: "Scout",
+    greeting: "Research scout online. I can gather sources, compare options, and brief you fast.",
+    systemPrompt:
+      "You are a source-grounded research scout inspired by Clawdbot workflows. Search before answering when the topic is current, compare evidence clearly, cite sources, call out uncertainty, and end with a crisp recommendation or next step.",
+    useInternet: true,
+    agentMode: true,
+    handsFree: false,
+    autoSpeak: true,
+    temperature: 0.4,
+    maxTokens: 500,
+    builderPrompt:
+      "Create a research scout bot that prioritizes internet-grounded answers, clickable sources, and concise decision-ready summaries."
+  },
+  {
+    id: "home-ops",
+    kicker: "Home Assistant",
+    name: "Home Ops",
+    description: "Smart-home operator for devices, scenes, radios, and household automations.",
+    note: "Optimized for Home Assistant control and household routines.",
+    assistantName: "Home Ops",
+    greeting: "Home ops is standing by for scenes, devices, and automations.",
+    systemPrompt:
+      "You are a home-operations assistant inspired by Clawdbot home automation skills. Focus on Home Assistant tasks, device state checks, scene orchestration, and practical household automations. Confirm risky actions briefly, but otherwise move decisively.",
+    useInternet: false,
+    agentMode: true,
+    handsFree: false,
+    autoSpeak: true,
+    temperature: 0.5,
+    maxTokens: 350,
+    builderPrompt:
+      "Create a Home Assistant bot that feels like a household operations console, can manage radios and scenes, and answers with short voice-friendly confirmations."
+  },
+  {
+    id: "memory-vault",
+    kicker: "Memory",
+    name: "Memory Vault",
+    description: "Long-running capture bot for notes, summaries, decisions, and personal context.",
+    note: "Strong for journaling, meeting notes, and persistent memory.",
+    assistantName: "Vault",
+    greeting: "Memory vault open. I can capture details, summarize them, and keep the important parts available later.",
+    systemPrompt:
+      "You are a reflective memory and notes assistant inspired by Clawdbot memory workflows. Capture durable facts, summarize decisions, preserve preferences, and help the user turn rough notes into reusable memory. Be structured, calm, and dependable.",
+    useInternet: false,
+    agentMode: true,
+    handsFree: false,
+    autoSpeak: false,
+    temperature: 0.5,
+    maxTokens: 550,
+    builderPrompt:
+      "Create a memory vault bot that turns conversations into summaries, durable notes, and future-useful context without being verbose."
+  },
+  {
+    id: "inbox-captain",
+    kicker: "Provider Flow",
+    name: "Inbox Captain",
+    description: "Triage assistant for WhatsApp-style chats, email drafting, and quick routing decisions.",
+    note: "Useful for messages, follow-ups, and communication cleanup.",
+    assistantName: "Captain",
+    greeting: "Inbox captain ready. I can sort messages, draft replies, and keep communication moving.",
+    systemPrompt:
+      "You are a communications triage assistant inspired by Clawdbot's multi-provider inbox workflow. Summarize threads, draft crisp replies, surface unanswered items, and help the user route work across email, chat, and follow-ups.",
+    useInternet: false,
+    agentMode: true,
+    handsFree: false,
+    autoSpeak: true,
+    temperature: 0.55,
+    maxTokens: 420,
+    builderPrompt:
+      "Create an inbox captain bot for WhatsApp-style chats and email drafting that triages conversations, drafts responses, and flags missing follow-ups."
+  },
+  {
+    id: "travel-dispatch",
+    kicker: "Planning",
+    name: "Travel Dispatch",
+    description: "Planning bot for trips, schedules, checklists, and route comparisons.",
+    note: "Great for itineraries, rail or flight comparisons, and packing prep.",
+    assistantName: "Dispatch",
+    greeting: "Travel dispatch online. I can compare routes, organize plans, and keep the trip checklist straight.",
+    systemPrompt:
+      "You are a travel planning dispatcher inspired by Clawdbot showcase automations. Build practical itineraries, compare routes and timing, create checklists, and keep answers brief enough to use while moving.",
+    useInternet: true,
+    agentMode: true,
+    handsFree: false,
+    autoSpeak: true,
+    temperature: 0.45,
+    maxTokens: 520,
+    builderPrompt:
+      "Create a travel dispatch bot that compares options, organizes itineraries, and turns messy planning into a concise step-by-step trip plan."
+  },
+];
 
 const state = {
   messages: [],
@@ -68,7 +186,9 @@ const state = {
   microphones: [],
   recognition: null,
   isListening: false,
+  isListeningPending: false,
   isSending: false,
+  isSpeechPlaybackPending: false,
   shouldResumeListening: false,
   finalTranscript: "",
   speechRequestId: 0,
@@ -92,6 +212,21 @@ const state = {
   composerDraft: "",
   botPromptRecognition: null,
   isBotPromptListening: false,
+  clapAudioContext: null,
+  clapMonitorStream: null,
+  clapAnalyser: null,
+  clapSourceNode: null,
+  clapTimeDomainData: null,
+  clapFrequencyData: null,
+  clapMonitorFrameId: 0,
+  clapNoiseFloor: 0.012,
+  clapLastPeak: 0,
+  clapCooldownUntil: 0,
+  wakePhraseRecognition: null,
+  isWakePhraseListening: false,
+  isWakePhraseStarting: false,
+  startListeningAfterWakePhraseStops: false,
+  wakePhraseRestartTimer: 0,
 };
 
 const elements = {
@@ -112,11 +247,14 @@ const elements = {
   botBuilderPrompt: document.querySelector("#bot-builder-prompt"),
   recordBotPrompt: document.querySelector("#record-bot-prompt"),
   createBotFromPrompt: document.querySelector("#create-bot-from-prompt"),
+  clawdSkillGrid: document.querySelector("#clawd-skill-grid"),
   botStudioStatus: document.querySelector("#bot-studio-status"),
   systemPrompt: document.querySelector("#system-prompt"),
   autoSpeak: document.querySelector("#auto-speak"),
   useInternet: document.querySelector("#use-internet"),
   agentMode: document.querySelector("#agent-mode"),
+  clapWake: document.querySelector("#clap-wake"),
+  clapWakeNote: document.querySelector("#clap-wake-note"),
   handsFree: document.querySelector("#hands-free"),
   temperature: document.querySelector("#temperature"),
   temperatureValue: document.querySelector("#temperature-value"),
@@ -353,6 +491,100 @@ function normalizeBotProfile(profile = {}, fallback = {}) {
   };
 }
 
+function findClawdSkillTemplate(value) {
+  const normalizedValue = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+
+  if (!normalizedValue) {
+    return null;
+  }
+
+  return (
+    CLAWD_SKILL_TEMPLATES.find(
+      (template) =>
+        template.id === normalizedValue ||
+        template.name.toLowerCase() === normalizedValue ||
+        template.name.toLowerCase().replace(/\s+/g, "-") === normalizedValue
+    ) || null
+  );
+}
+
+function getClawdSkillCatalogText() {
+  return [
+    "Available ClawdHub-style skill packs:",
+    ...CLAWD_SKILL_TEMPLATES.map(
+      (template) => `- ${template.name} (/skill ${template.id}): ${template.description}`
+    ),
+  ].join("\n");
+}
+
+function installClawdSkillTemplate(template, { announce = true } = {}) {
+  if (!template) {
+    return null;
+  }
+
+  syncActiveBotFromControls();
+
+  const nextBot = normalizeBotProfile({
+    id: createBotId(),
+    name: template.name,
+    description: template.description,
+    assistantName: template.assistantName,
+    greeting: template.greeting,
+    systemPrompt: template.systemPrompt,
+    selectedModel: elements.modelSelect.value,
+    selectedSpeechModel: elements.speechModelSelect.value,
+    selectedVoice: elements.voiceSelect.value,
+    useInternet: template.useInternet,
+    agentMode: template.agentMode,
+    handsFree: template.handsFree,
+    autoSpeak: template.autoSpeak,
+    temperature: template.temperature,
+    maxTokens: template.maxTokens,
+  });
+
+  state.bots.push(nextBot);
+  applyBotToControls(nextBot, { persist: false });
+
+  if (elements.botBuilderPrompt) {
+    elements.botBuilderPrompt.value = template.builderPrompt;
+  }
+
+  saveSettings();
+
+  if (announce) {
+    setHelperText(
+      elements.botStudioStatus,
+      `Installed "${template.name}" and switched the workspace to that Clawdbot-style skill pack.`
+    );
+  }
+
+  return nextBot;
+}
+
+function renderClawdSkillLibrary() {
+  if (!elements.clawdSkillGrid) {
+    return;
+  }
+
+  elements.clawdSkillGrid.innerHTML = CLAWD_SKILL_TEMPLATES.map(
+    (template) => `
+      <button
+        class="shortcut-tile clawd-skill-tile"
+        type="button"
+        data-clawd-skill-id="${template.id}"
+        title="Install ${template.name}"
+      >
+        <span class="shortcut-kicker">${template.kicker}</span>
+        <strong>${template.name}</strong>
+        <span class="shortcut-note">${template.note}</span>
+      </button>
+    `
+  ).join("");
+}
+
 function buildBotProfileFromCurrentControls(overrides = {}) {
   const fallbackBot = state.bots.find((bot) => bot.id === state.activeBotId) || {};
 
@@ -537,6 +769,7 @@ function saveSettings() {
       systemPrompt: elements.systemPrompt.value.trim() || defaults.systemPrompt,
       autoSpeak: elements.autoSpeak.checked,
       handsFree: elements.handsFree.checked,
+      clapWake: elements.clapWake.checked,
       temperature: Number(elements.temperature.value),
       maxTokens: Number(elements.maxTokens.value),
       thinkingLevel: state.thinkingLevel,
@@ -2145,15 +2378,353 @@ function setHeroListeningState(isListening) {
   elements.heroOrb?.classList.toggle("is-listening", isListening);
 }
 
-function startListening() {
-  if (!state.recognition || state.isListening) {
+function updateClapWakeNote(message) {
+  if (!elements.clapWakeNote) {
+    return;
+  }
+
+  elements.clapWakeNote.textContent = message;
+}
+
+function refreshClapWakeNote() {
+  if (!elements.clapWake?.checked) {
+    updateClapWakeNote("Wake listener is off.");
+    return;
+  }
+
+  if (!state.recognition) {
+    updateClapWakeNote("Wake listener needs browser speech recognition support in Chrome or Edge.");
+    return;
+  }
+
+  if (!state.clapMonitorStream) {
+    updateClapWakeNote('Allow microphone access to arm clap or "Talk to me" wake.');
+    return;
+  }
+
+  if (state.isListeningPending) {
+    updateClapWakeNote("Wake signal detected. Starting the conversation...");
+    return;
+  }
+
+  if (state.isListening) {
+    updateClapWakeNote("Listening now. Wake listener will re-arm after this turn.");
+    return;
+  }
+
+  if (window.speechSynthesis?.speaking) {
+    updateClapWakeNote("Wake listener pauses while the assistant is speaking.");
+    return;
+  }
+
+  updateClapWakeNote('Clap once or say "Talk to me" to start the conversation.');
+}
+
+function isClapWakeArmed() {
+  return Boolean(
+    elements.clapWake?.checked &&
+      state.recognition &&
+      state.clapMonitorStream &&
+      !state.isListening &&
+      !state.isListeningPending &&
+      !state.isBotPromptListening &&
+      !state.isSending &&
+      !state.isSpeechPlaybackPending &&
+      !window.speechSynthesis?.speaking
+  );
+}
+
+function detectClapFrame() {
+  if (!state.clapAnalyser || !state.clapTimeDomainData || !state.clapFrequencyData) {
+    return false;
+  }
+
+  state.clapAnalyser.getFloatTimeDomainData(state.clapTimeDomainData);
+  state.clapAnalyser.getByteFrequencyData(state.clapFrequencyData);
+
+  let sumSquares = 0;
+  let peak = 0;
+  let zeroCrossings = 0;
+  let impulseSamples = 0;
+  let previousSample = state.clapTimeDomainData[0] || 0;
+
+  for (let index = 0; index < state.clapTimeDomainData.length; index += 1) {
+    const currentSample = state.clapTimeDomainData[index];
+    const absoluteSample = Math.abs(currentSample);
+    sumSquares += currentSample * currentSample;
+    peak = Math.max(peak, absoluteSample);
+
+    if (absoluteSample > 0.25) {
+      impulseSamples += 1;
+    }
+
+    if (
+      (previousSample <= 0 && currentSample > 0) ||
+      (previousSample >= 0 && currentSample < 0)
+    ) {
+      zeroCrossings += 1;
+    }
+
+    previousSample = currentSample;
+  }
+
+  const rms = Math.sqrt(sumSquares / state.clapTimeDomainData.length);
+  const zeroCrossingRate = zeroCrossings / state.clapTimeDomainData.length;
+  const impulseRatio = impulseSamples / state.clapTimeDomainData.length;
+
+  let lowBandEnergy = 0;
+  let highBandEnergy = 0;
+  const splitIndex = Math.floor(state.clapFrequencyData.length * 0.32);
+
+  for (let index = 0; index < state.clapFrequencyData.length; index += 1) {
+    const value = state.clapFrequencyData[index];
+    if (index < splitIndex) {
+      lowBandEnergy += value;
+    } else {
+      highBandEnergy += value;
+    }
+  }
+
+  const highBandRatio = highBandEnergy / Math.max(1, lowBandEnergy + highBandEnergy);
+  const peakThreshold = Math.max(0.22, state.clapNoiseFloor * 6);
+  const rmsThreshold = Math.max(0.035, state.clapNoiseFloor * 4);
+  const candidateDetected =
+    peak >= peakThreshold &&
+    rms >= rmsThreshold &&
+    highBandRatio >= 0.52 &&
+    zeroCrossingRate >= 0.09 &&
+    impulseRatio <= 0.18 &&
+    peak >= state.clapLastPeak * 1.35;
+
+  if (!candidateDetected) {
+    state.clapNoiseFloor = state.clapNoiseFloor * 0.94 + rms * 0.06;
+  }
+
+  state.clapLastPeak = peak;
+  return candidateDetected;
+}
+
+function monitorClapWake() {
+  if (!state.clapAnalyser) {
+    state.clapMonitorFrameId = 0;
+    return;
+  }
+
+  const now = Date.now();
+  if (isClapWakeArmed() && now >= state.clapCooldownUntil && detectClapFrame()) {
+    state.clapCooldownUntil = now + 1400;
+    refreshClapWakeNote();
+    startListening();
+  }
+
+  state.clapMonitorFrameId = window.requestAnimationFrame(monitorClapWake);
+}
+
+async function stopClapWakeMonitor() {
+  if (state.clapMonitorFrameId) {
+    window.cancelAnimationFrame(state.clapMonitorFrameId);
+  }
+
+  state.clapMonitorFrameId = 0;
+  state.clapAnalyser?.disconnect?.();
+  state.clapSourceNode?.disconnect?.();
+  stopMediaStream(state.clapMonitorStream);
+
+  if (state.clapAudioContext?.state && state.clapAudioContext.state !== "closed") {
+    try {
+      await state.clapAudioContext.close();
+    } catch {}
+  }
+
+  state.clapAudioContext = null;
+  state.clapMonitorStream = null;
+  state.clapAnalyser = null;
+  state.clapSourceNode = null;
+  state.clapTimeDomainData = null;
+  state.clapFrequencyData = null;
+  state.clapNoiseFloor = 0.012;
+  state.clapLastPeak = 0;
+  state.clapCooldownUntil = 0;
+}
+
+async function startClapWakeMonitor() {
+  if (!elements.clapWake?.checked) {
+    await stopClapWakeMonitor();
+    refreshClapWakeNote();
+    return;
+  }
+
+  if (state.clapMonitorStream || !navigator.mediaDevices?.getUserMedia) {
+    refreshClapWakeNote();
+    return;
+  }
+
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext || null;
+  if (!AudioContextCtor) {
+    updateClapWakeNote("Clap wake needs Web Audio support in this browser.");
     return;
   }
 
   try {
-    state.recognition.start();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    });
+    const audioContext = new AudioContextCtor();
+    const sourceNode = audioContext.createMediaStreamSource(stream);
+    const analyser = audioContext.createAnalyser();
+
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.12;
+    sourceNode.connect(analyser);
+
+    state.clapAudioContext = audioContext;
+    state.clapMonitorStream = stream;
+    state.clapSourceNode = sourceNode;
+    state.clapAnalyser = analyser;
+    state.clapTimeDomainData = new Float32Array(analyser.fftSize);
+    state.clapFrequencyData = new Uint8Array(analyser.frequencyBinCount);
+    state.clapNoiseFloor = 0.012;
+    state.clapLastPeak = 0;
+    state.clapCooldownUntil = 0;
+
+    if (audioContext.state === "suspended") {
+      try {
+        await audioContext.resume();
+      } catch {}
+    }
+
+    refreshClapWakeNote();
+    monitorClapWake();
   } catch (error) {
+    await stopClapWakeMonitor();
+    updateClapWakeNote(
+      error?.name === "NotAllowedError"
+        ? "Allow microphone access to use clap wake."
+        : `Clap wake unavailable: ${error.message}`
+    );
+  }
+}
+
+async function syncClapWakeMonitor() {
+  if (!elements.clapWake?.checked || !state.recognition) {
+    await stopClapWakeMonitor();
+    refreshClapWakeNote();
+    return;
+  }
+
+  if (!state.clapMonitorStream) {
+    await startClapWakeMonitor();
+    return;
+  }
+
+  refreshClapWakeNote();
+}
+
+function clearWakePhraseRestartTimer() {
+  if (!state.wakePhraseRestartTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.wakePhraseRestartTimer);
+  state.wakePhraseRestartTimer = 0;
+}
+
+function shouldWakePhraseBeActive() {
+  return Boolean(
+    elements.clapWake?.checked &&
+      state.recognition &&
+      state.wakePhraseRecognition &&
+      !state.isListening &&
+      !state.isListeningPending &&
+      !state.isBotPromptListening &&
+      !state.isSending &&
+      !state.isSpeechPlaybackPending &&
+      !window.speechSynthesis?.speaking
+  );
+}
+
+function stopWakePhraseRecognition() {
+  clearWakePhraseRestartTimer();
+
+  if (!state.wakePhraseRecognition) {
+    state.isWakePhraseListening = false;
+    state.isWakePhraseStarting = false;
+    return;
+  }
+
+  if (!state.isWakePhraseListening && !state.isWakePhraseStarting) {
+    state.isWakePhraseListening = false;
+    state.isWakePhraseStarting = false;
+    return;
+  }
+
+  try {
+    state.wakePhraseRecognition.stop();
+  } catch {
+    state.isWakePhraseListening = false;
+    state.isWakePhraseStarting = false;
+  }
+}
+
+function scheduleWakePhraseRestart() {
+  if (state.wakePhraseRestartTimer) {
+    return;
+  }
+
+  state.wakePhraseRestartTimer = window.setTimeout(() => {
+    state.wakePhraseRestartTimer = 0;
+    syncWakePhraseRecognition();
+  }, 320);
+}
+
+function syncWakePhraseRecognition() {
+  if (!shouldWakePhraseBeActive()) {
+    stopWakePhraseRecognition();
+    refreshClapWakeNote();
+    return;
+  }
+
+  if (state.isWakePhraseListening || state.isWakePhraseStarting) {
+    refreshClapWakeNote();
+    return;
+  }
+
+  try {
+    state.isWakePhraseStarting = true;
+    state.wakePhraseRecognition.start();
+  } catch {
+    state.isWakePhraseStarting = false;
+    scheduleWakePhraseRestart();
+  }
+}
+
+function startListening() {
+  if (!state.recognition || state.isListening || state.isListeningPending) {
+    return false;
+  }
+
+  if (state.isWakePhraseListening || state.isWakePhraseStarting) {
+    state.startListeningAfterWakePhraseStops = true;
+    stopWakePhraseRecognition();
+    refreshClapWakeNote();
+    return true;
+  }
+
+  try {
+    state.isListeningPending = true;
+    refreshClapWakeNote();
+    state.recognition.start();
+    return true;
+  } catch (error) {
+    state.isListeningPending = false;
+    refreshClapWakeNote();
     elements.liveTranscript.textContent = `Voice input error: ${error.message}`;
+    return false;
   }
 }
 
@@ -2700,6 +3271,8 @@ async function refreshMicrophones() {
     option.textContent = "Device listing unavailable";
     elements.micSelect.appendChild(option);
     setStatus(elements.micStatus, "Browser cannot list microphones.", true);
+    await stopClapWakeMonitor();
+    refreshClapWakeNote();
     return;
   }
 
@@ -2717,6 +3290,8 @@ async function refreshMicrophones() {
     setStatus(elements.micStatus, "Microphone permission not granted.", true);
     elements.micNote.textContent =
       "Allow microphone access in the browser, then refresh mics. Speech recognition uses your system default microphone.";
+    await stopClapWakeMonitor();
+    refreshClapWakeNote();
     return;
   }
 
@@ -2732,6 +3307,8 @@ async function refreshMicrophones() {
       option.textContent = "No microphones detected";
       elements.micSelect.appendChild(option);
       setStatus(elements.micStatus, "No microphones detected.", true);
+      await stopClapWakeMonitor();
+      refreshClapWakeNote();
       return;
     }
 
@@ -2752,8 +3329,11 @@ async function refreshMicrophones() {
     setStatus(elements.micStatus, selectedLabel);
     elements.micNote.textContent =
       "Browser speech recognition listens to the system default microphone. Use this list to confirm the device labels available on this computer.";
+    await syncClapWakeMonitor();
   } catch (error) {
     setStatus(elements.micStatus, `Could not list microphones: ${error.message}`, true);
+    await stopClapWakeMonitor();
+    refreshClapWakeNote();
   }
 }
 
@@ -2773,6 +3353,7 @@ function setupRecognition() {
     elements.listenButton.disabled = true;
     elements.micNote.textContent =
       "Open the app on localhost in Chrome or Edge, then allow microphone access.";
+    refreshClapWakeNote();
     return;
   }
 
@@ -2785,12 +3366,20 @@ function setupRecognition() {
   recognition.interimResults = true;
   recognition.lang = "en-US";
 
+  const wakePhraseRecognition = new RecognitionCtor();
+  wakePhraseRecognition.continuous = true;
+  wakePhraseRecognition.interimResults = true;
+  wakePhraseRecognition.lang = "en-US";
+
   recognition.onstart = () => {
+    state.isListeningPending = false;
     state.isListening = true;
     state.finalTranscript = "";
     updateListeningUi("Listening", "Stop voice input");
     setHeroListeningState(true);
     elements.liveTranscript.textContent = "Listening...";
+    refreshClapWakeNote();
+    syncWakePhraseRecognition();
   };
 
   recognition.onresult = (event) => {
@@ -2811,6 +3400,7 @@ function setupRecognition() {
   };
 
   recognition.onerror = (event) => {
+    state.isListeningPending = false;
     state.isListening = false;
     updateListeningUi("Voice error", "Start voice input");
     setHeroListeningState(false);
@@ -2818,13 +3408,17 @@ function setupRecognition() {
       event.error === "not-allowed"
         ? "Microphone permission was denied."
         : `Voice input error: ${event.error}`;
+    refreshClapWakeNote();
+    syncWakePhraseRecognition();
   };
 
   recognition.onend = async () => {
     const transcript = state.finalTranscript.trim();
+    state.isListeningPending = false;
     state.isListening = false;
     updateListeningUi("Idle", "Start voice input");
     setHeroListeningState(false);
+    refreshClapWakeNote();
 
     if (transcript) {
       elements.messageInput.value = transcript;
@@ -2837,15 +3431,85 @@ function setupRecognition() {
     if (!elements.liveTranscript.textContent.trim()) {
       elements.liveTranscript.textContent = "Start voice input or type a request below.";
     }
+
+    syncWakePhraseRecognition();
+  };
+
+  wakePhraseRecognition.onstart = () => {
+    state.isWakePhraseStarting = false;
+    state.isWakePhraseListening = true;
+    refreshClapWakeNote();
+  };
+
+  wakePhraseRecognition.onresult = (event) => {
+    let transcript = "";
+
+    for (let index = event.resultIndex; index < event.results.length; index += 1) {
+      transcript += `${event.results[index][0].transcript} `;
+    }
+
+    if (!WAKE_PHRASE_PATTERN.test(transcript.trim().toLowerCase())) {
+      return;
+    }
+
+    if (state.isListening || state.isListeningPending) {
+      return;
+    }
+
+    state.startListeningAfterWakePhraseStops = true;
+    updateClapWakeNote('Wake phrase heard. Starting the conversation...');
+    stopWakePhraseRecognition();
+  };
+
+  wakePhraseRecognition.onerror = (event) => {
+    state.isWakePhraseStarting = false;
+    state.isWakePhraseListening = false;
+
+    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+      updateClapWakeNote(
+        'Allow microphone access so clap wake and the "Talk to me" phrase can start the conversation.'
+      );
+      return;
+    }
+
+    if (event.error !== "aborted" && shouldWakePhraseBeActive()) {
+      scheduleWakePhraseRestart();
+    }
+
+    refreshClapWakeNote();
+  };
+
+  wakePhraseRecognition.onend = () => {
+    state.isWakePhraseStarting = false;
+    state.isWakePhraseListening = false;
+
+    if (state.startListeningAfterWakePhraseStops) {
+      state.startListeningAfterWakePhraseStops = false;
+      const started = startListening();
+      if (!started) {
+        scheduleWakePhraseRestart();
+      }
+      return;
+    }
+
+    if (shouldWakePhraseBeActive()) {
+      scheduleWakePhraseRestart();
+    }
+
+    refreshClapWakeNote();
   };
 
   state.recognition = recognition;
+  state.wakePhraseRecognition = wakePhraseRecognition;
+  refreshClapWakeNote();
+  syncWakePhraseRecognition();
 }
 
 function stopSpeaking() {
   state.speechRequestId += 1;
   window.speechSynthesis?.cancel?.();
   state.shouldResumeListening = false;
+  refreshClapWakeNote();
 }
 
 function splitLongSpeechSegment(segment, maxLength) {
@@ -2980,14 +3644,21 @@ async function prepareSpeechText(text, requestId) {
 
 async function speakText(text) {
   if (!elements.autoSpeak.checked || !window.speechSynthesis || !text.trim()) {
+    state.isSpeechPlaybackPending = false;
+    syncWakePhraseRecognition();
     return;
   }
 
   stopSpeaking();
+  state.isSpeechPlaybackPending = true;
   const requestId = state.speechRequestId;
   const spokenText = await prepareSpeechText(text, requestId);
 
   if (!spokenText || requestId !== state.speechRequestId) {
+    if (requestId === state.speechRequestId) {
+      state.isSpeechPlaybackPending = false;
+      syncWakePhraseRecognition();
+    }
     return;
   }
 
@@ -2995,6 +3666,8 @@ async function speakText(text) {
   const chunks = splitTextForSpeech(spokenText);
 
   if (!chunks.length) {
+    state.isSpeechPlaybackPending = false;
+    syncWakePhraseRecognition();
     return;
   }
 
@@ -3003,6 +3676,8 @@ async function speakText(text) {
       return;
     }
 
+    state.isSpeechPlaybackPending = false;
+
     if (state.shouldResumeListening && state.recognition && !state.isListening) {
       state.shouldResumeListening = false;
       startListening();
@@ -3010,11 +3685,16 @@ async function speakText(text) {
     }
 
     state.shouldResumeListening = false;
+    refreshClapWakeNote();
+    syncWakePhraseRecognition();
   };
 
   const handleSpeechError = () => {
     if (requestId === state.speechRequestId) {
+      state.isSpeechPlaybackPending = false;
       state.shouldResumeListening = false;
+      refreshClapWakeNote();
+      syncWakePhraseRecognition();
     }
   };
 
@@ -3044,7 +3724,9 @@ async function speakText(text) {
 
     utterance.onerror = handleSpeechError;
 
+    stopWakePhraseRecognition();
     window.speechSynthesis.speak(utterance);
+    refreshClapWakeNote();
   };
 
   state.shouldResumeListening = elements.handsFree.checked;
@@ -3326,6 +4008,54 @@ async function handleSlashCommand(commandText) {
     return true;
   }
 
+  if (command === "cost") {
+    state.usageMode = /^(off|false|no)$/i.test(argument) ? "off" : "full";
+    rerenderChat();
+    appendAssistantMessage(
+      state.usageMode === "off"
+        ? "Per-response token and cost display disabled."
+        : "Per-response token and cost display enabled."
+    );
+    elements.liveTranscript.textContent = "Cost display updated.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "skills") {
+    appendAssistantMessage(getClawdSkillCatalogText());
+    elements.liveTranscript.textContent = "Skill pack catalog ready.";
+    saveSettings();
+    return true;
+  }
+
+  if (command === "skill") {
+    if (!argument) {
+      appendAssistantMessage(getClawdSkillCatalogText());
+      elements.liveTranscript.textContent = "Choose a skill pack to install.";
+      saveSettings();
+      return true;
+    }
+
+    const template = findClawdSkillTemplate(argument);
+    if (!template) {
+      throw new Error(
+        `Unknown skill pack "${argument}". Try /skills to see the available ClawdHub-style presets.`
+      );
+    }
+
+    const nextBot = installClawdSkillTemplate(template, { announce: true });
+    appendAssistantMessage(
+      nextBot
+        ? `Installed ${template.name} and switched the workspace to that Clawdbot-style bot profile.`
+        : `I couldn't install ${template.name}.`
+    );
+    elements.liveTranscript.textContent = nextBot
+      ? `${template.name} is ready.`
+      : "Skill pack install failed.";
+    saveSettings();
+    return true;
+  }
+
   if (command === "verbose") {
     state.verboseAgentMode = /^(on|true|yes)$/i.test(argument);
     rerenderChat();
@@ -3466,6 +4196,7 @@ async function sendCurrentMessage() {
     elements.sendButton.disabled = false;
     elements.listenButton.disabled = !state.recognition;
     saveSettings();
+    syncWakePhraseRecognition();
   }
 }
 
@@ -3574,6 +4305,21 @@ function attachEvents() {
       setHelperText(elements.botStudioStatus, error.message, true);
     });
   });
+  elements.clawdSkillGrid?.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-clawd-skill-id]");
+    const templateId = button?.getAttribute?.("data-clawd-skill-id") || "";
+
+    if (!templateId) {
+      return;
+    }
+
+    const template = findClawdSkillTemplate(templateId);
+    if (!template) {
+      return;
+    }
+
+    installClawdSkillTemplate(template, { announce: true });
+  });
 
   elements.shortcutTiles.forEach((button) => {
     button.addEventListener("click", () => {
@@ -3616,6 +4362,7 @@ function attachEvents() {
     elements.autoSpeak,
     elements.useInternet,
     elements.agentMode,
+    elements.clapWake,
     elements.handsFree,
     elements.modelSelect,
     elements.endpointInput,
@@ -3640,6 +4387,10 @@ function attachEvents() {
     element.addEventListener("change", () => {
       saveSettings();
       updateSpeechOutputStatus();
+      if (element === elements.clapWake) {
+        void syncClapWakeMonitor();
+        syncWakePhraseRecognition();
+      }
     });
   });
 
@@ -3733,6 +4484,8 @@ function applySettings() {
   elements.autoSpeak.checked = settings.autoSpeak;
   elements.useInternet.checked = settings.useInternet;
   elements.agentMode.checked = settings.agentMode;
+  elements.clapWake.checked =
+    typeof settings.clapWake === "boolean" ? settings.clapWake : defaults.clapWake;
   elements.handsFree.checked = settings.handsFree;
   elements.temperature.value = String(settings.temperature);
   elements.maxTokens.value = String(settings.maxTokens);
@@ -3761,6 +4514,7 @@ function applySettings() {
 
 async function initialize() {
   applySettings();
+  renderClawdSkillLibrary();
   attachEvents();
   setupRecognition();
   populateVoiceOptions();
