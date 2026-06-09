@@ -292,6 +292,20 @@ function handleListenButtonClick() {
   startListening();
 }
 
+function getSelectedPlaybackVoice() {
+  return state.voices.find((voice) => voice.name === elements.voiceSelect.value) || null;
+}
+
+function getVoiceInputLanguage() {
+  return getSelectedPlaybackVoice()?.lang || navigator.language || "en-US";
+}
+
+function syncVoiceInputLanguage() {
+  if (state.recognition) {
+    state.recognition.lang = getVoiceInputLanguage();
+  }
+}
+
 function populateVoiceOptions() {
   const voices = window.speechSynthesis?.getVoices?.() || [];
   state.voices = voices;
@@ -321,6 +335,7 @@ function populateVoiceOptions() {
     "";
 
   elements.voiceSelect.value = preferredVoice;
+  syncVoiceInputLanguage();
   updateSpeechOutputStatus();
 }
 
@@ -343,7 +358,8 @@ function populateSpeechModelOptions(models, defaultSpeechModel) {
   const settings = readSettings();
   const preferredSpeechModel =
     models.find((model) => model.id === settings.selectedSpeechModel)?.id ||
-    defaultSpeechModel ||
+    models.find((model) => model.id === defaultSpeechModel)?.id ||
+    models[0]?.id ||
     "";
 
   elements.speechModelSelect.value = preferredSpeechModel;
@@ -699,7 +715,7 @@ function setupRecognition() {
   const recognition = new RecognitionCtor();
   recognition.continuous = false;
   recognition.interimResults = true;
-  recognition.lang = "en-US";
+  recognition.lang = getVoiceInputLanguage();
 
   recognition.onstart = () => {
     state.isListening = true;
@@ -802,7 +818,9 @@ async function prepareSpeechText(text, requestId) {
     return (payload.text || text).trim();
   } catch (error) {
     if (requestId === state.speechRequestId) {
-      updateSpeechOutputStatus("Browser voice fallback for this reply");
+      updateSpeechOutputStatus(
+        `Speech polish failed: ${error.message}. Using the original reply.`
+      );
     }
 
     return text;
@@ -823,10 +841,14 @@ async function speakText(text) {
   }
 
   const utterance = new SpeechSynthesisUtterance(spokenText);
-  const voice = state.voices.find((entry) => entry.name === elements.voiceSelect.value);
+  const voice = getSelectedPlaybackVoice();
   if (voice) {
     utterance.voice = voice;
   }
+  utterance.lang = voice?.lang || getVoiceInputLanguage();
+  utterance.rate = 0.96;
+  utterance.pitch = 1.02;
+  utterance.volume = 1;
 
   state.shouldResumeListening = elements.handsFree.checked;
 
@@ -919,7 +941,7 @@ async function sendCurrentMessage() {
     elements.liveTranscript.textContent = "Reply ready.";
     void speakText(assistantReply);
   } catch (error) {
-    const failureMessage = `I hit a problem reaching LM Studio: ${error.message}`;
+    const failureMessage = `LM Studio could not complete the request: ${error.message}`;
     state.messages.push({ role: "assistant", content: failureMessage });
     rerenderChat();
     elements.liveTranscript.textContent = "Something went wrong.";
@@ -979,6 +1001,9 @@ function attachEvents() {
     element.addEventListener("change", () => {
       saveSettings();
       updateSpeechOutputStatus();
+      if (element === elements.voiceSelect) {
+        syncVoiceInputLanguage();
+      }
     });
   });
 

@@ -20,6 +20,57 @@ const pageMarkup = `
         </div>
       </header>
 
+      <button
+        id="focus-mode-button"
+        class="focus-mode-button"
+        type="button"
+        aria-label="Start focus mode"
+      >
+        <span class="focus-mode-brand" aria-hidden="true">
+          <span class="focus-mode-brand-mark"></span>
+          <span>
+            <strong>Lumen</strong>
+            <span>Personal voice assistant</span>
+          </span>
+        </span>
+        <span class="hero-orb focus-mode-orb" aria-hidden="true">
+          <span class="orb-core">
+            <span class="orb-ring orb-ring-a"></span>
+            <span class="orb-ring orb-ring-b"></span>
+            <span class="orb-ring orb-ring-c"></span>
+            <span class="orb-mic"></span>
+          </span>
+        </span>
+        <span id="focus-mode-status" class="focus-mode-status">Ready</span>
+        <span class="focus-mode-subtitle">Focus mode</span>
+        <span id="focus-mode-action" class="focus-mode-action">
+          <span class="focus-mode-action-icon" aria-hidden="true"></span>
+          <span>Start</span>
+        </span>
+      </button>
+      <button
+        id="focus-mode-exit"
+        class="focus-mode-exit"
+        type="button"
+        aria-label="Minimize focus mode"
+        title="Minimize focus mode"
+      >
+        <span aria-hidden="true"></span>
+      </button>
+      <aside id="focus-insights" class="focus-insights" aria-live="polite" hidden>
+        <div class="focus-insights-head">
+          <div>
+            <span class="focus-insights-kicker">Live insight</span>
+            <h2 id="focus-insights-title">Request details</h2>
+          </div>
+          <span id="focus-insights-badge" class="focus-insights-badge">Ready</span>
+        </div>
+        <p id="focus-insights-summary" class="focus-insights-summary"></p>
+        <div id="focus-insights-stats" class="focus-insights-stats"></div>
+        <div id="focus-insights-chart" class="focus-insights-chart" hidden></div>
+        <pre id="focus-insights-output" class="focus-insights-output" hidden></pre>
+      </aside>
+
       <div class="desktop-layout">
         <aside class="workspace-sidebar">
           <div class="sidebar-brand">
@@ -90,7 +141,7 @@ const pageMarkup = `
           <div class="workspace-grid">
             <section class="workspace-focus">
               <section class="hero-card workspace-orb-card">
-                <div class="hero-orb" aria-hidden="true">
+                <div class="hero-orb quick-actions-orb" aria-hidden="true">
                   <div class="orb-core">
                     <span class="orb-ring orb-ring-a"></span>
                     <span class="orb-ring orb-ring-b"></span>
@@ -481,7 +532,26 @@ const pageMarkup = `
                 <span>Agent mode</span>
                 <input id="agent-mode" type="checkbox" />
               </label>
+              <label class="toggle">
+                <span>Education mode</span>
+                <input id="education-mode" type="checkbox" />
+              </label>
             </div>
+            <button
+              id="french-mode-button"
+              class="mode-button"
+              type="button"
+              aria-pressed="false"
+            >
+              <span>
+                <strong>Français</strong>
+                <small>Réponses et saisie vocale en français</small>
+              </span>
+              <span id="french-mode-state" class="mode-button-state">Off</span>
+            </button>
+            <p id="learning-mode-note" class="helper-text">
+              Education mode explains concepts step by step. French mode can be combined with it.
+            </p>
             <p id="clap-wake-note" class="helper-text">
               Clap once or say "Talk to me" to start the conversation.
             </p>

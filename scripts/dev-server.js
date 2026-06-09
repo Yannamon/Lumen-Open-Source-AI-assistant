@@ -27,35 +27,24 @@ function checkPortAvailable(port, hostname) {
   });
 }
 
-async function findAvailablePort(startPort, hostname, attempts = 10) {
-  for (let offset = 0; offset < attempts; offset += 1) {
-    const port = startPort + offset;
-    const available = await checkPortAvailable(port, hostname);
+async function main() {
+  const dir = process.cwd();
+  const port = Number(process.env.PORT || 3000);
+  const hostname = process.env.HOST || undefined;
+  const available = await checkPortAvailable(port, hostname);
 
-    if (available) {
-      return port;
-    }
+  if (!available) {
+    console.log(
+      `Port ${port} is already in use. Lumen may already be running at http://localhost:${port}.`
+    );
+    return;
   }
 
-  throw new Error(`Could not find an available port between ${startPort} and ${startPort + attempts - 1}.`);
-}
-
-async function main() {
   process.env.LUMEN_NEXT_DIST_DIR = ".next-dev";
 
-  const dir = process.cwd();
-  const requestedPort = Number(process.env.PORT || 3000);
-  const hostname = process.env.HOST || undefined;
   const config = await loadConfig(PHASE_DEVELOPMENT_SERVER, dir, {
     silent: false,
   });
-  const port = process.env.PORT
-    ? requestedPort
-    : await findAvailablePort(requestedPort, hostname);
-
-  if (port !== requestedPort) {
-    console.log(`Port ${requestedPort} is busy, starting the dev server on http://localhost:${port} instead.`);
-  }
 
   setGlobal("phase", PHASE_DEVELOPMENT_SERVER);
   setGlobal("distDir", path.join(dir, config.distDir || ".next"));

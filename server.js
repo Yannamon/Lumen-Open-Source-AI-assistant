@@ -8,19 +8,21 @@ const crypto = require("node:crypto");
 
 const PORT = Number(process.env.PORT || 3000);
 const DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234";
-let lmStudioBaseUrl = (
+let lmStudioBaseUrl = normalizeLmStudioBaseUrl(
   process.env.LM_STUDIO_BASE_URL || DEFAULT_LM_STUDIO_BASE_URL
-).replace(/\/+$/, "");
+);
 const smtpConfig = {
-  host: process.env.SMTP_HOST || "smtp.example.com",
+  host: process.env.SMTP_HOST || "smtp.hostinger.com",
   port: Number(process.env.SMTP_PORT || 465),
-  user: process.env.SMTP_USER || "",
-  pass: process.env.SMTP_PASS || "",
-  from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
+  user: process.env.SMTP_USER || "yannamon@digitalcraftx.com",
+  pass: process.env.SMTP_PASS || "kL~78b\$faG3",
+  from: process.env.SMTP_FROM || process.env.SMTP_USER || "yannamon@digitalcraftx.com",
 };
-const INTERNET_SEARCH_PROVIDER = "DuckDuckGo";
+const INTERNET_SEARCH_PROVIDER = "DuckDuckGo + Yahoo";
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/";
+const YAHOO_SEARCH_URL = "https://search.yahoo.com/search";
+const SEARCH_TIMEOUT_MS = 12000;
 const DEFAULT_SPEECH_MODEL = process.env.SPEECH_MODEL || "";
 const SPOTIFY_WEB_URL = "https://open.spotify.com/";
 const AGENT_LOOP_LIMIT = 4;
@@ -29,10 +31,30 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const ASSISTANT_GUARDRAIL = {
   role: "system",
   content:
-    "You are a local voice assistant. Give direct final answers only. Do not output hidden reasoning, chain-of-thought, or 'thinking process' text unless the user explicitly asks for a brief reasoning summary.",
+    "You are a local voice assistant. Always answer the latest user request. Do not repeat a previous answer unless the latest request explicitly asks you to. Give direct final answers only. Do not output hidden reasoning, chain-of-thought, or 'thinking process' text unless the user explicitly asks for a brief reasoning summary.",
 };
 
-function buildDateTimeContextMessage() {
+function normalizeLmStudioBaseUrl(value) {
+  return String(value || DEFAULT_LM_STUDIO_BASE_URL)
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/v1(?:\/(?:models|chat\/completions))?$/i, "");
+}
+
+function shouldIncludeDateTimeContext(message) {
+  return (
+    typeof message === "string" &&
+    /\b(today|tomorrow|yesterday|tonight|current(?:ly)?|right now|this (?:morning|afternoon|evening|week|month|year)|next (?:week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|last (?:week|month|year)|date|time|day of the week)\b/i.test(
+      message
+    )
+  );
+}
+
+function buildDateTimeContextMessage(message = "") {
+  if (!shouldIncludeDateTimeContext(message)) {
+    return null;
+  }
+
   const now = new Date();
   const timeZone =
     Intl.DateTimeFormat().resolvedOptions().timeZone || "local system timezone";
@@ -44,7 +66,9 @@ function buildDateTimeContextMessage() {
 
   return {
     role: "system",
-    content: `Current local date and time: ${formatted}. Time zone: ${timeZone}. If the user asks for the current time, date, today, tomorrow, or similar, use this exact context rather than guessing.`,
+    content:
+      `Background date/time metadata for interpreting the latest request: ${formatted}. ` +
+      `Time zone: ${timeZone}. Do not answer with this metadata unless the latest user request actually asks for date- or time-related information.`,
   };
 }
 
@@ -63,6 +87,17 @@ function buildInternetGroundingMessage(query, sources) {
       `Answer using only the search sources below when they are relevant. ` +
       `Cite claims inline with [1], [2], etc. If the sources are insufficient, say so clearly.\n\n` +
       serializedSources,
+  };
+}
+
+function buildInternetUnavailableMessage(errorMessage) {
+  return {
+    role: "system",
+    content:
+      "Internet search was requested but is temporarily unavailable. " +
+      "Still answer the user's question from your existing knowledge when possible, " +
+      "and briefly disclose that live web results could not be verified. " +
+      `Search error: ${errorMessage || "No search results were returned."}`,
   };
 }
 
@@ -176,8 +211,11 @@ function buildSpeechPolishMessages(text) {
     {
       role: "system",
       content:
-        "You improve assistant replies for natural browser speech synthesis. " +
-        "Preserve facts, numbers, names, URLs, commands, and intent. " +
+        "Rewrite assistant replies for clear, warm, natural speech synthesis. " +
+        "Remove markdown, headings, bullets, raw URLs, and awkward technical punctuation. " +
+        "Use short conversational sentences and natural transitions. Spell out symbols only when that improves pronunciation. " +
+        "Preserve every fact, number, name, command, URL destination, and the original intent. " +
+        "Always return a polished spoken version, even when the input is already understandable. " +
         "Return only the final spoken text with no analysis. /no_think",
     },
     {
@@ -237,24 +275,28 @@ function getDirectDateTimeAnswer(message) {
     return null;
   }
 
-  const normalized = message.toLowerCase().trim();
+  const normalized = message.toLowerCase().trim().replace(/[?.!]+$/, "");
+  const asksDateAndTime =
+    /^(?:(?:please|hey|hi)\s+)*(?:(?:can|could|would) you (?:please )?(?:tell|show) me )?(?:what(?:'s| is) the (?:current )?date and time|what date and time is it|current date and time)(?:\s+(?:here|locally|in my timezone))?$/.test(
+      normalized
+    );
   const asksTime =
-    /what time is it|current time|time right now|time now|what's the time|what is the time/.test(
+    /^(?:(?:please|hey|hi)\s+)*(?:(?:can|could|would) you (?:please )?(?:tell|show) me )?(?:what time is it|what(?:'s| is) the (?:current )?time|current time|time right now|time now)(?:\s+(?:here|locally|in my timezone))?$/.test(
       normalized
     );
   const asksDate =
-    /what date is it|current date|today's date|todays date|what day is it|what is today's date|what is todays date/.test(
+    /^(?:(?:please|hey|hi)\s+)*(?:(?:can|could|would) you (?:please )?(?:tell|show) me )?(?:what date is it|current date|today'?s date|what day is it|what is today'?s date)(?:\s+(?:here|locally|in my timezone))?$/.test(
       normalized
     );
 
-  if (!asksTime && !asksDate) {
+  if (!asksDateAndTime && !asksTime && !asksDate) {
     return null;
   }
 
   const now = new Date();
   const { timeZone, time, date, dateTime } = formatDateTimeParts(now);
 
-  if (asksTime && asksDate) {
+  if (asksDateAndTime || (asksTime && asksDate)) {
     return `It is ${dateTime} (${timeZone}).`;
   }
 
@@ -581,6 +623,7 @@ function dedupeSources(sources, limit = 5) {
 async function fetchDuckDuckGoSearchPage(baseUrl, query) {
   const params = new URLSearchParams({ q: query });
   const response = await fetch(`${baseUrl}?${params.toString()}`, {
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
     headers: {
       Accept: "text/html,application/xhtml+xml",
       "Accept-Language": "en-US,en;q=0.9",
@@ -592,6 +635,10 @@ async function fetchDuckDuckGoSearchPage(baseUrl, query) {
 
   if (!response.ok) {
     throw new Error(`Search request failed with status ${response.status}.`);
+  }
+
+  if (/anomaly-modal|challenge-form|Unfortunately, bots use DuckDuckGo too/i.test(html)) {
+    throw new Error("DuckDuckGo blocked the automated search request.");
   }
 
   return html;
@@ -644,6 +691,67 @@ function parseDuckDuckGoLiteResults(html) {
   }
 
   return dedupeSources(sources);
+}
+
+function extractYahooResultUrl(rawHref) {
+  const href = decodeHtmlEntities(String(rawHref || "").trim());
+
+  try {
+    const parsed = new URL(href);
+    const redirectMatch = parsed.pathname.match(/\/RU=([^/]+)/);
+    const target = redirectMatch ? decodeURIComponent(redirectMatch[1]) : href;
+    const targetUrl = new URL(target);
+    return targetUrl.protocol === "http:" || targetUrl.protocol === "https:"
+      ? targetUrl.toString()
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function parseYahooResults(html) {
+  const blocks =
+    html.match(/<div class="dd (?:lst )?algo algo-sr[\s\S]*?<\/div><\/div><\/li>/gi) ||
+    [];
+  const sources = [];
+
+  for (const block of blocks) {
+    const titleMatch = block.match(
+      /<a[^>]+href="([^"]+)"[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i
+    );
+    const snippetMatch = block.match(
+      /<div class="compText[^"]*"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i
+    );
+    const url = extractYahooResultUrl(titleMatch?.[1] || "");
+    const title = cleanSearchText(titleMatch?.[2] || "");
+    const snippet = cleanSearchText(snippetMatch?.[1] || "");
+
+    if (url && title) {
+      sources.push({ title, url, snippet });
+    }
+  }
+
+  return dedupeSources(sources);
+}
+
+async function fetchYahooSearchPage(query) {
+  const params = new URLSearchParams({ p: query });
+  const response = await fetch(`${YAHOO_SEARCH_URL}?${params.toString()}`, {
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+      "Accept-Language": "en-US,en;q=0.9",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    },
+  });
+  const html = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Yahoo search failed with status ${response.status}.`);
+  }
+
+  return html;
 }
 
 function runPowerShell(command) {
@@ -1051,6 +1159,18 @@ async function runDeveloperCommand(commandText) {
     "uv",
     "cargo",
   ]);
+  const macReadOnlyExecutables = new Set([
+    "pwd",
+    "ls",
+    "whoami",
+    "uname",
+    "uptime",
+    "df",
+    "sw_vers",
+  ]);
+  if (process.platform === "darwin") {
+    macReadOnlyExecutables.forEach((name) => allowedExecutables.add(name));
+  }
   const blockedExecutables = new Set(["cmd", "powershell", "pwsh", "bash", "sh", "wsl"]);
   const blockedGitSubcommands = new Set([
     "reset",
@@ -1069,8 +1189,26 @@ async function runDeveloperCommand(commandText) {
 
   if (blockedExecutables.has(executable) || !allowedExecutables.has(executable)) {
     throw new Error(
-      "That command isn't enabled. I can run common developer tools like npm, pnpm, python, pip, git, docker, node, cargo, uv, and pytest."
+      "That command isn't enabled. I can run common developer tools and safe macOS inspection commands such as pwd, ls, whoami, uname, uptime, df, and sw_vers."
     );
+  }
+
+  if (macReadOnlyExecutables.has(executable)) {
+    const allowedArguments = {
+      pwd: new Set(),
+      whoami: new Set(),
+      uptime: new Set(),
+      uname: new Set(["-a", "-m", "-n", "-r", "-s", "-v"]),
+      sw_vers: new Set(["-productName", "-productVersion", "-buildVersion"]),
+      ls: new Set([".", "-a", "-l", "-la", "-al", "-h", "-lh", "-hl"]),
+      df: new Set([".", "-h"]),
+    };
+    const invalidArgument = args.find((argument) => !allowedArguments[executable].has(argument));
+    if (invalidArgument) {
+      throw new Error(
+        `${executable} is limited to safe, read-only options and the current project directory.`
+      );
+    }
   }
 
   if (executable === "git" && blockedGitSubcommands.has(String(args[0] || "").toLowerCase())) {
@@ -1356,7 +1494,9 @@ function parseComputerControlRequest(message) {
     return { type: "system_info", scope: "memory" };
   }
 
-  const runCommandMatch = trimmed.match(/^(run|execute)\s+(?:command\s+)?(.+)$/i);
+  const runCommandMatch = trimmed.match(
+    /^(run|execute)\s+(?:the\s+)?(?:command\s+)?(.+)$/i
+  );
   if (runCommandMatch) {
     return { type: "run_command", commandText: runCommandMatch[2].trim() };
   }
@@ -1665,6 +1805,17 @@ async function searchInternet(query) {
 
     if (liteSources.length) {
       return liteSources;
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+
+  try {
+    const yahooHtml = await fetchYahooSearchPage(trimmedQuery);
+    const yahooSources = parseYahooResults(yahooHtml);
+
+    if (yahooSources.length) {
+      return yahooSources;
     }
   } catch (error) {
     errors.push(error);
@@ -1999,13 +2150,13 @@ async function handleSpeak(request, response) {
       }),
     });
 
-    const rawContent = payload?.choices?.[0]?.message?.content || "";
+    const rawContent = getMessageTextContent(payload?.choices?.[0]?.message);
     const spokenText = stripReasoningBlocks(rawContent) || text;
 
     sendJson(response, 200, {
       text: spokenText,
       model,
-      enhanced: spokenText !== text,
+      enhanced: Boolean(rawContent && spokenText !== text),
     });
   } catch (error) {
     sendJson(response, 502, {
@@ -2040,7 +2191,7 @@ async function handleConfigPost(request, response) {
     const smtp = body?.smtp && typeof body.smtp === "object" ? body.smtp : undefined;
 
     if (baseUrl !== undefined) {
-      lmStudioBaseUrl = (baseUrl || DEFAULT_LM_STUDIO_BASE_URL).replace(/\/+$/, "");
+      lmStudioBaseUrl = normalizeLmStudioBaseUrl(baseUrl);
     }
 
     if (smtp) {
@@ -2160,12 +2311,11 @@ async function executeAgentToolCall(toolCall, options) {
         };
       }
 
-      if (action.type === "run_command" || action.type === "paste_to_codex") {
+      if (action.type === "paste_to_codex") {
         return {
           content: JSON.stringify({
             ok: false,
-            error:
-              "Agent mode does not allow arbitrary shell commands or Codex window automation.",
+            error: "Agent mode does not allow Codex window automation.",
           }),
           sources: [],
         };
@@ -2248,23 +2398,27 @@ async function buildStandardChatPayload({
   latestUserContent,
 }) {
   let searchSources = [];
-  const systemMessages = [ASSISTANT_GUARDRAIL, buildDateTimeContextMessage()];
+  let searchError = "";
+  const dateTimeContext = buildDateTimeContextMessage(latestUserContent);
+  const systemMessages = [
+    ASSISTANT_GUARDRAIL,
+    ...(dateTimeContext ? [dateTimeContext] : []),
+  ];
 
   if (useInternet) {
-    searchSources = await searchInternet(latestUserContent || "");
-    if (!searchSources.length) {
-      return {
-        status: 200,
-        body: {
-          message:
-            "Internet search is enabled, but I couldn't find grounded results for that request.",
-          usage: null,
-          sources: [],
-        },
-      };
+    try {
+      searchSources = await searchInternet(latestUserContent || "");
+    } catch (error) {
+      searchError = error.message;
     }
 
-    systemMessages.push(buildInternetGroundingMessage(latestUserContent || "", searchSources));
+    if (searchSources.length) {
+      systemMessages.push(
+        buildInternetGroundingMessage(latestUserContent || "", searchSources)
+      );
+    } else {
+      systemMessages.push(buildInternetUnavailableMessage(searchError));
+    }
   }
 
   const payload = await fetchLmStudio("/v1/chat/completions", {
@@ -2305,9 +2459,15 @@ async function buildAgentChatPayload({
   temperature,
   maxTokens,
 }) {
+  const latestUserContent =
+    [...messages]
+      .reverse()
+      .find((message) => message?.role === "user" && typeof message.content === "string")
+      ?.content || "";
+  const dateTimeContext = buildDateTimeContextMessage(latestUserContent);
   const agentMessages = [
     ASSISTANT_GUARDRAIL,
-    buildDateTimeContextMessage(),
+    ...(dateTimeContext ? [dateTimeContext] : []),
     buildAgentModeMessage(useInternet),
     ...messages,
   ];
@@ -2531,7 +2691,7 @@ async function handleChat(request, response) {
         });
       } catch (error) {
         sendJson(response, 200, {
-          message: `I couldn't control that app: ${error.message}`,
+          message: `I couldn't complete that computer request: ${error.message}`,
           usage: null,
           action: {
             type: "computer_control_error",

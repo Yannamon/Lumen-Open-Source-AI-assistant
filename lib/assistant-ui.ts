@@ -11,6 +11,10 @@ export function initAssistantUi() {
 
 const DEFAULT_ASSISTANT_PROMPT =
   "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.";
+const EDUCATION_MODE_PROMPT =
+  "Education mode is enabled. Act as a patient, encouraging tutor. Explain concepts step by step, adapt the depth to the learner's apparent level, use clear examples or analogies, and emphasize understanding over memorization. When useful, end with one short check-for-understanding question or practice prompt. Still answer direct questions directly.";
+const FRENCH_MODE_PROMPT =
+  "French mode is enabled. Respond in natural, clear French unless the user explicitly asks for another language. Preserve code, commands, URLs, product names, and other literals exactly when translating them.";
 
 const defaults = {
   endpoint: "http://127.0.0.1:1234",
@@ -30,6 +34,8 @@ const defaults = {
   whatsappSystemPrompt: DEFAULT_ASSISTANT_PROMPT,
   useInternet: false,
   agentMode: false,
+  educationMode: false,
+  frenchMode: false,
   clapWake: true,
   assistantName: "Lumen",
   systemPrompt: DEFAULT_ASSISTANT_PROMPT,
@@ -184,9 +190,15 @@ const state = {
   visualExamples: null,
   visualDownloadUrl: null,
   microphones: [],
+  microphonePermissionGranted: false,
+  voiceRecorder: null,
+  voiceCaptureStream: null,
+  voiceCaptureChunks: [],
+  isVoiceTranscribing: false,
   recognition: null,
   isListening: false,
   isListeningPending: false,
+  isFocusModeActive: false,
   isSending: false,
   isSpeechPlaybackPending: false,
   shouldResumeListening: false,
@@ -253,6 +265,10 @@ const elements = {
   autoSpeak: document.querySelector("#auto-speak"),
   useInternet: document.querySelector("#use-internet"),
   agentMode: document.querySelector("#agent-mode"),
+  educationMode: document.querySelector("#education-mode"),
+  frenchModeButton: document.querySelector("#french-mode-button"),
+  frenchModeState: document.querySelector("#french-mode-state"),
+  learningModeNote: document.querySelector("#learning-mode-note"),
   clapWake: document.querySelector("#clap-wake"),
   clapWakeNote: document.querySelector("#clap-wake-note"),
   handsFree: document.querySelector("#hands-free"),
@@ -304,6 +320,18 @@ const elements = {
   whatsappStatus: document.querySelector("#whatsapp-status"),
   heroTitle: document.querySelector("#hero-title"),
   heroOrb: document.querySelector(".hero-orb"),
+  heroOrbs: Array.from(document.querySelectorAll(".hero-orb")),
+  focusModeButton: document.querySelector("#focus-mode-button"),
+  focusModeExit: document.querySelector("#focus-mode-exit"),
+  focusModeStatus: document.querySelector("#focus-mode-status"),
+  focusModeAction: document.querySelector("#focus-mode-action span:last-child"),
+  focusInsights: document.querySelector("#focus-insights"),
+  focusInsightsTitle: document.querySelector("#focus-insights-title"),
+  focusInsightsBadge: document.querySelector("#focus-insights-badge"),
+  focusInsightsSummary: document.querySelector("#focus-insights-summary"),
+  focusInsightsStats: document.querySelector("#focus-insights-stats"),
+  focusInsightsChart: document.querySelector("#focus-insights-chart"),
+  focusInsightsOutput: document.querySelector("#focus-insights-output"),
   listenButton: document.querySelector("#listen-button"),
   clearChat: document.querySelector("#clear-chat"),
   listeningIndicator: document.querySelector("#listening-indicator"),
@@ -677,8 +705,16 @@ function applyBotToControls(bot, { persist = true } = {}) {
   elements.assistantName.value = normalizedBot.assistantName;
   elements.systemPrompt.value = normalizedBot.systemPrompt;
   elements.modelSelect.value = normalizedBot.selectedModel;
-  elements.speechModelSelect.value = normalizedBot.selectedSpeechModel;
-  elements.voiceSelect.value = normalizedBot.selectedVoice;
+  if (
+    Array.from(elements.speechModelSelect.options).some(
+      (option) => option.value === normalizedBot.selectedSpeechModel
+    )
+  ) {
+    elements.speechModelSelect.value = normalizedBot.selectedSpeechModel;
+  }
+  if (state.voices.some((voice) => voice.name === normalizedBot.selectedVoice)) {
+    elements.voiceSelect.value = normalizedBot.selectedVoice;
+  }
   elements.useInternet.checked = normalizedBot.useInternet;
   elements.agentMode.checked = normalizedBot.agentMode;
   elements.handsFree.checked = normalizedBot.handsFree;
@@ -766,6 +802,8 @@ function saveSettings() {
         elements.whatsappSystemPrompt.value.trim() || defaults.whatsappSystemPrompt,
       useInternet: elements.useInternet.checked,
       agentMode: elements.agentMode.checked,
+      educationMode: elements.educationMode.checked,
+      frenchMode: isFrenchModeEnabled(),
       systemPrompt: elements.systemPrompt.value.trim() || defaults.systemPrompt,
       autoSpeak: elements.autoSpeak.checked,
       handsFree: elements.handsFree.checked,
@@ -1872,7 +1910,7 @@ function startBotPromptCapture() {
   }
 
   const recognition = new Recognition();
-  recognition.lang = "en-US";
+  recognition.lang = getVoiceInputLanguage();
   recognition.interimResults = false;
   recognition.maxAlternatives = 1;
   recognition.continuous = false;
@@ -2372,10 +2410,252 @@ function updateHeroTitle() {
 function updateListeningUi(label, buttonLabel) {
   elements.listeningIndicator.textContent = label;
   elements.listenButton.textContent = buttonLabel;
+  updateFocusModeUi(label, buttonLabel);
 }
 
 function setHeroListeningState(isListening) {
-  elements.heroOrb?.classList.toggle("is-listening", isListening);
+  elements.heroOrbs.forEach((orb) => {
+    orb.classList.toggle("is-listening", isListening);
+    orb.classList.remove("is-error");
+  });
+}
+
+function setHeroRespondingState(isResponding) {
+  elements.heroOrbs.forEach((orb) => {
+    orb.classList.toggle("is-responding", isResponding);
+  });
+}
+
+function setHeroErrorState(hasError) {
+  elements.heroOrbs.forEach((orb) => {
+    orb.classList.toggle("is-error", hasError);
+  });
+}
+
+function setFocusModeActive(isActive) {
+  state.isFocusModeActive = isActive;
+  elements.pageShell?.classList.toggle("is-focus-mode", isActive);
+  if (!isActive) {
+    hideFocusInsights();
+  }
+  updateFocusModeUi(
+    state.isListening ? "Listening" : "Idle",
+    state.isListening ? "Stop voice input" : "Start voice input"
+  );
+}
+
+function hideFocusInsights() {
+  if (elements.focusInsights) {
+    elements.focusInsights.hidden = true;
+  }
+  elements.pageShell?.classList.remove("has-focus-insights");
+}
+
+function createFocusInsightStat(label, value) {
+  const card = document.createElement("div");
+  card.className = "focus-insight-stat";
+
+  const statLabel = document.createElement("span");
+  statLabel.textContent = label;
+  const statValue = document.createElement("strong");
+  statValue.textContent = value;
+  card.append(statLabel, statValue);
+  return card;
+}
+
+function extractFocusMetrics(text) {
+  const normalized = String(text || "")
+    .replace(/[*_`#>|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const metrics = [];
+  const labels = new Set();
+
+  const addMetric = (label, displayValue, numericValue, isPercentage = false) => {
+    const cleanLabel = String(label || "")
+      .replace(/^(?:the|a|an)\s+/i, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 28);
+    const key = cleanLabel.toLowerCase();
+    if (!cleanLabel || !displayValue || labels.has(key) || !Number.isFinite(numericValue)) {
+      return;
+    }
+    labels.add(key);
+    metrics.push({
+      label: cleanLabel,
+      value: String(displayValue).trim(),
+      numericValue,
+      isPercentage,
+    });
+  };
+
+  const knownPatterns = [
+    ["CPU", /\bCPU(?:\s+usage)?\D{0,24}(\d+(?:\.\d+)?)\s*%/i, "%"],
+    ["Memory", /\b(?:memory|RAM)(?:\s+usage)?\D{0,32}(\d+(?:\.\d+)?)\s*%/i, "%"],
+    ["Disk", /\b(?:disk|storage)(?:\s+usage)?\D{0,32}(\d+(?:\.\d+)?)\s*%/i, "%"],
+    ["Battery", /\bbattery\D{0,24}(\d+(?:\.\d+)?)\s*%/i, "%"],
+  ];
+
+  knownPatterns.forEach(([label, pattern, suffix]) => {
+    const match = normalized.match(pattern);
+    if (match) {
+      addMetric(label, `${match[1]}${suffix}`, Number(match[1]), true);
+    }
+  });
+
+  const genericPattern =
+    /\b([A-Za-z][A-Za-z0-9 /_-]{1,24}?)\s*(?:is|are|was|were|:|=|at|about|around)\s*(-?\d+(?:\.\d+)?)\s*(%|TB|GB|MB|KB|ms|seconds?|minutes?|hours?|days?|cores?|items?|users?|requests?|tokens?)\b/gi;
+  let match;
+  while ((match = genericPattern.exec(normalized)) && metrics.length < 6) {
+    const unit = match[3];
+    addMetric(
+      match[1],
+      `${match[2]} ${unit}`.replace(" %", "%"),
+      Number(match[2]),
+      unit === "%"
+    );
+  }
+
+  return metrics.slice(0, 6);
+}
+
+function renderFocusInsightChart(metrics) {
+  if (!elements.focusInsightsChart) {
+    return;
+  }
+
+  elements.focusInsightsChart.replaceChildren();
+  const chartMetrics = metrics.filter((metric) => metric.numericValue >= 0).slice(0, 6);
+  if (chartMetrics.length < 2) {
+    elements.focusInsightsChart.hidden = true;
+    return;
+  }
+
+  const allPercentages = chartMetrics.every((metric) => metric.isPercentage);
+  const maximum = allPercentages
+    ? 100
+    : Math.max(...chartMetrics.map((metric) => metric.numericValue), 1);
+
+  chartMetrics.forEach((metric) => {
+    const bar = document.createElement("div");
+    bar.className = "focus-insight-bar";
+    bar.title = `${metric.label}: ${metric.value}`;
+
+    const fill = document.createElement("div");
+    fill.className = "focus-insight-bar-fill";
+    const height = Math.max(7, Math.min(100, (metric.numericValue / maximum) * 100));
+    fill.style.setProperty("--focus-bar-height", `${height}%`);
+
+    const label = document.createElement("span");
+    label.className = "focus-insight-bar-label";
+    label.textContent = metric.label;
+    bar.append(fill, label);
+    elements.focusInsightsChart.append(bar);
+  });
+  elements.focusInsightsChart.hidden = false;
+}
+
+function beginFocusInsights(prompt) {
+  if (!state.isFocusModeActive || !elements.focusInsights) {
+    return null;
+  }
+
+  const commandMatch = prompt.match(
+    /^(?:run|execute)\s+(?:the\s+)?(?:command\s+)?(.+)/i
+  );
+  elements.focusInsights.hidden = false;
+  elements.pageShell?.classList.add("has-focus-insights");
+  elements.focusInsightsTitle.textContent = commandMatch ? "macOS command" : "Request details";
+  elements.focusInsightsBadge.textContent = "Working";
+  elements.focusInsightsSummary.textContent = commandMatch
+    ? `Running ${commandMatch[1].trim()} on this Mac.`
+    : "Building a live summary from the assistant's response.";
+  elements.focusInsightsStats.replaceChildren(
+    createFocusInsightStat("Status", "Analyzing")
+  );
+  elements.focusInsightsChart.hidden = true;
+  elements.focusInsightsChart.replaceChildren();
+  elements.focusInsightsOutput.hidden = true;
+  elements.focusInsightsOutput.textContent = "";
+  return { startedAt: performance.now(), isCommand: Boolean(commandMatch) };
+}
+
+function finishFocusInsights(request, prompt, reply, payload = {}) {
+  if (!request || !elements.focusInsights || !state.isFocusModeActive) {
+    return;
+  }
+
+  const elapsedMs = Math.max(0, performance.now() - request.startedAt);
+  const metrics = extractFocusMetrics(reply);
+  const responseWords = String(reply || "").trim().split(/\s+/).filter(Boolean).length;
+  const sourceCount = Array.isArray(payload.sources) ? payload.sources.length : 0;
+  const cards = metrics.map((metric) => createFocusInsightStat(metric.label, metric.value));
+
+  cards.push(createFocusInsightStat("Response", `${(elapsedMs / 1000).toFixed(1)}s`));
+  cards.push(createFocusInsightStat("Words", String(responseWords)));
+  if (sourceCount > 0) {
+    cards.push(createFocusInsightStat("Sources", String(sourceCount)));
+  }
+
+  elements.focusInsightsStats.replaceChildren(...cards.slice(0, 6));
+  elements.focusInsightsTitle.textContent = request.isCommand ? "Command result" : "Response insight";
+  elements.focusInsightsBadge.textContent = "Ready";
+  elements.focusInsightsSummary.textContent = metrics.length
+    ? `Key measurements found in the answer to "${prompt.slice(0, 72)}${prompt.length > 72 ? "..." : ""}"`
+    : "Response metadata and a concise view of the requested information.";
+  renderFocusInsightChart(metrics);
+
+  if (request.isCommand) {
+    elements.focusInsightsOutput.textContent = String(reply || "").trim();
+    elements.focusInsightsOutput.hidden = false;
+  }
+}
+
+function failFocusInsights(request, error) {
+  if (!request || !elements.focusInsights || !state.isFocusModeActive) {
+    return;
+  }
+  elements.focusInsightsBadge.textContent = "Error";
+  elements.focusInsightsSummary.textContent = error?.message || "The request could not be completed.";
+  elements.focusInsightsStats.replaceChildren(createFocusInsightStat("Status", "Failed"));
+  elements.focusInsightsChart.hidden = true;
+}
+
+function shouldStartInFocusMode() {
+  return window.matchMedia?.("(max-width: 760px)").matches === true;
+}
+
+function updateFocusModeUi(label, buttonLabel) {
+  const isStopping = /^stop/i.test(buttonLabel || "");
+  const isResponding = state.isSending;
+  const status = isResponding ? "Responding" : label === "Idle" ? "Ready" : label;
+  const action = state.isFocusModeActive
+    ? isResponding
+      ? "Wait"
+      : isStopping
+        ? "Stop"
+        : "Start"
+    : "Focus";
+
+  if (elements.focusModeStatus) {
+    elements.focusModeStatus.textContent = status;
+  }
+
+  if (elements.focusModeAction) {
+    elements.focusModeAction.textContent = action;
+  }
+
+  if (elements.focusModeButton) {
+    elements.focusModeButton.setAttribute(
+      "aria-label",
+      isResponding
+        ? "Lumen is responding"
+        : state.isFocusModeActive && isStopping
+          ? "Stop focus mode"
+          : "Start focus mode"
+    );
+  }
 }
 
 function updateClapWakeNote(message) {
@@ -2423,6 +2703,8 @@ function refreshClapWakeNote() {
 function isClapWakeArmed() {
   return Boolean(
     elements.clapWake?.checked &&
+      state.microphonePermissionGranted &&
+      !shouldUseRecordedVoiceFallback() &&
       state.recognition &&
       state.clapMonitorStream &&
       !state.isListening &&
@@ -2611,7 +2893,11 @@ async function startClapWakeMonitor() {
 }
 
 async function syncClapWakeMonitor() {
-  if (!elements.clapWake?.checked || !state.recognition) {
+  if (
+    !elements.clapWake?.checked ||
+    !state.recognition ||
+    shouldUseRecordedVoiceFallback()
+  ) {
     await stopClapWakeMonitor();
     refreshClapWakeNote();
     return;
@@ -2637,6 +2923,8 @@ function clearWakePhraseRestartTimer() {
 function shouldWakePhraseBeActive() {
   return Boolean(
     elements.clapWake?.checked &&
+      state.microphonePermissionGranted &&
+      !shouldUseRecordedVoiceFallback() &&
       state.recognition &&
       state.wakePhraseRecognition &&
       !state.isListening &&
@@ -2728,8 +3016,240 @@ function startListening() {
   }
 }
 
-function handleListenButtonClick() {
+function isAppleMobileDevice() {
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+function canRecordVoiceFallback() {
+  return Boolean(
+    window.isSecureContext &&
+      navigator.mediaDevices?.getUserMedia &&
+      window.MediaRecorder
+  );
+}
+
+function isVoiceInputAvailable() {
+  return Boolean(state.recognition || canRecordVoiceFallback());
+}
+
+function shouldUseRecordedVoiceFallback() {
+  return isAppleMobileDevice() || !state.recognition;
+}
+
+function getPreferredVoiceCaptureMimeType() {
+  const candidates = isAppleMobileDevice()
+    ? [
+        "audio/mp4",
+        "audio/mp4;codecs=mp4a.40.2",
+        "audio/webm;codecs=opus",
+        "audio/webm",
+      ]
+    : [
+        "audio/webm;codecs=opus",
+        "audio/ogg;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+      ];
+
+  return candidates.find((type) => window.MediaRecorder?.isTypeSupported?.(type)) || "";
+}
+
+function resetVoiceCapture() {
+  stopMediaStream(state.voiceCaptureStream);
+  state.voiceCaptureStream = null;
+  state.voiceRecorder = null;
+  state.voiceCaptureChunks = [];
+  state.isListening = false;
+  state.isListeningPending = false;
+  setHeroListeningState(false);
+}
+
+async function transcribeRecordedVoice(blob, mimeType) {
+  const extension = getScreenTranscriptExtension(mimeType);
+  const file = new File([blob], `iphone-voice-input.${extension}`, {
+    type: mimeType || "audio/mp4",
+  });
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const language = elements.transcriptionLanguage.value.trim();
+  if (language) {
+    formData.append("language", language);
+  }
+
+  state.isVoiceTranscribing = true;
+  updateListeningUi("Transcribing", "Start voice input");
+  elements.liveTranscript.textContent = "Transcribing voice input...";
+
+  try {
+    const response = await fetch("/api/transcribe", {
+      method: "POST",
+      body: formData,
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.details || payload.error || "Voice transcription failed.");
+    }
+
+    const transcript = String(payload.text || "").trim();
+    if (!transcript) {
+      throw new Error("The transcription service returned no text.");
+    }
+
+    elements.messageInput.value = transcript;
+    elements.liveTranscript.textContent = transcript;
+    await sendCurrentMessage();
+  } catch (error) {
+    setHeroErrorState(true);
+    elements.liveTranscript.textContent = `Voice transcription failed: ${error.message}`;
+  } finally {
+    state.isVoiceTranscribing = false;
+    updateListeningUi("Idle", "Start voice input");
+  }
+}
+
+async function startRecordedVoiceCapture() {
+  if (!canRecordVoiceFallback() || state.isVoiceTranscribing) {
+    elements.liveTranscript.textContent = getMicrophoneAccessMessage();
+    return false;
+  }
+
+  try {
+    stopSpeaking();
+    stopWakePhraseRecognition();
+    await stopClapWakeMonitor();
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const audioTrack = stream.getAudioTracks()[0];
+    const detectedMic =
+      audioTrack?.label ||
+      audioTrack?.getSettings?.().deviceId ||
+      "Apple system microphone";
+    const mimeType = getPreferredVoiceCaptureMimeType();
+    const recorder = mimeType
+      ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 128000 })
+      : new MediaRecorder(stream);
+
+    state.microphonePermissionGranted = true;
+    state.voiceCaptureStream = stream;
+    state.voiceRecorder = recorder;
+    state.voiceCaptureChunks = [];
+    state.isListening = true;
+    setStatus(elements.micStatus, detectedMic);
+    setHeroErrorState(false);
+    setHeroListeningState(true);
+    updateListeningUi("Recording", "Stop voice input");
+    elements.liveTranscript.textContent = "Recording from the iPhone microphone. Tap again to stop.";
+
+    recorder.ondataavailable = (event) => {
+      if (event.data?.size) {
+        state.voiceCaptureChunks.push(event.data);
+      }
+    };
+
+    recorder.onerror = () => {
+      resetVoiceCapture();
+      updateListeningUi("Voice error", "Start voice input");
+      elements.liveTranscript.textContent = "The browser stopped recording the microphone.";
+    };
+
+    recorder.onstop = () => {
+      const chunks = [...state.voiceCaptureChunks];
+      const recordedType = recorder.mimeType || mimeType || "audio/mp4";
+      resetVoiceCapture();
+
+      if (!chunks.length) {
+        updateListeningUi("Idle", "Start voice input");
+        elements.liveTranscript.textContent = "No microphone audio was captured.";
+        return;
+      }
+
+      void transcribeRecordedVoice(new Blob(chunks, { type: recordedType }), recordedType);
+    };
+
+    recorder.start();
+    return true;
+  } catch (error) {
+    resetVoiceCapture();
+    const message = getMicrophoneAccessMessage(error);
+    setStatus(elements.micStatus, message, true);
+    elements.micNote.textContent = message;
+    elements.liveTranscript.textContent = message;
+    return false;
+  }
+}
+
+function stopRecordedVoiceCapture() {
+  if (!state.voiceRecorder || state.voiceRecorder.state === "inactive") {
+    return false;
+  }
+
+  elements.liveTranscript.textContent = "Finishing the recording...";
+  state.voiceRecorder.stop();
+  return true;
+}
+
+function getMicrophoneAccessMessage(error = null) {
+  if (!window.isSecureContext) {
+    return "Microphone access on iPhone requires HTTPS. Open the assistant from an HTTPS address, then tap the mic again.";
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return "This browser does not expose microphone access. On iPhone, use Safari and an HTTPS address.";
+  }
+
+  if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+    return "Microphone access is blocked. On iPhone, open Settings > Safari > Microphone, allow access, then tap the mic again.";
+  }
+
+  return `Microphone access failed${error?.message ? `: ${error.message}` : "."}`;
+}
+
+async function requestMicrophonePermission() {
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    const message = getMicrophoneAccessMessage();
+    setStatus(elements.micStatus, message, true);
+    elements.micNote.textContent = message;
+    elements.liveTranscript.textContent = message;
+    return false;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+    state.microphonePermissionGranted = true;
+    setStatus(elements.micStatus, "Microphone access allowed");
+    elements.micNote.textContent =
+      "Microphone access is ready. Voice recognition uses the iPhone system microphone.";
+    return true;
+  } catch (error) {
+    state.microphonePermissionGranted = false;
+    const message = getMicrophoneAccessMessage(error);
+    setStatus(elements.micStatus, message, true);
+    elements.micNote.textContent = message;
+    elements.liveTranscript.textContent = message;
+    return false;
+  }
+}
+
+async function handleListenButtonClick() {
+  if (state.voiceRecorder && state.voiceRecorder.state !== "inactive") {
+    stopRecordedVoiceCapture();
+    return;
+  }
+
+  if (shouldUseRecordedVoiceFallback()) {
+    await startRecordedVoiceCapture();
+    return;
+  }
+
   if (!state.recognition) {
+    elements.liveTranscript.textContent =
+      "Voice recognition is unavailable in this browser. On iPhone, use Safari over HTTPS.";
     return;
   }
 
@@ -2739,7 +3259,199 @@ function handleListenButtonClick() {
   }
 
   stopSpeaking();
+  if (!(await requestMicrophonePermission())) {
+    return;
+  }
   startListening();
+  void refreshMicrophones();
+}
+
+async function handleFocusModeButtonClick() {
+  if (state.voiceRecorder && state.voiceRecorder.state !== "inactive") {
+    stopRecordedVoiceCapture();
+    setFocusModeActive(false);
+    return;
+  }
+
+  if (shouldUseRecordedVoiceFallback()) {
+    if (!state.isFocusModeActive) {
+      setFocusModeActive(true);
+    }
+    await startRecordedVoiceCapture();
+    return;
+  }
+
+  if (!state.recognition) {
+    if (!state.isFocusModeActive) {
+      setFocusModeActive(true);
+    }
+    elements.liveTranscript.textContent =
+      "Voice recognition is unavailable in this browser. On iPhone, use Safari over HTTPS.";
+    return;
+  }
+
+  if (state.isSending) {
+    return;
+  }
+
+  if (!state.isFocusModeActive) {
+    setFocusModeActive(true);
+    stopSpeaking();
+    if (!(await requestMicrophonePermission())) {
+      return;
+    }
+    startListening();
+    void refreshMicrophones();
+    return;
+  }
+
+  if (state.isListening || state.isListeningPending) {
+    state.recognition.stop();
+    setFocusModeActive(false);
+    return;
+  }
+
+  stopSpeaking();
+  if (!(await requestMicrophonePermission())) {
+    return;
+  }
+  startListening();
+  void refreshMicrophones();
+}
+
+function minimizeFocusMode() {
+  if (state.voiceRecorder && state.voiceRecorder.state !== "inactive") {
+    stopRecordedVoiceCapture();
+  }
+
+  if (state.isListening || state.isListeningPending) {
+    try {
+      state.recognition?.stop();
+    } catch {}
+  }
+
+  setFocusModeActive(false);
+}
+
+function getSelectedPlaybackVoice() {
+  return state.voices.find((voice) => voice.name === elements.voiceSelect.value) || null;
+}
+
+const PREFERRED_VOICE_NAMES = {
+  french: ["jacques", "thomas", "audrey", "aurélie", "aurelie", "marie", "amélie", "amelie", "paul"],
+  english: ["samantha", "ava", "zoe", "daniel", "karen", "moira", "tessa", "alex"],
+};
+const LOW_QUALITY_VOICE_PATTERN =
+  /\b(albert|bad news|bahh|bells|boing|bubbles|cellos|compact|espeak|festival|fred|good news|jester|junior|kathy|novelty|organ|superstar|trinoids|whisper|wobble|zarvox)\b/i;
+
+function scorePlaybackVoice(voice, language) {
+  const normalizedLanguage = String(language || "").toLowerCase();
+  const voiceLanguage = String(voice?.lang || "").toLowerCase().replace("_", "-");
+  const voiceName = String(voice?.name || "").toLowerCase();
+  const isFrench = normalizedLanguage.startsWith("fr");
+  const preferredNames = isFrench
+    ? PREFERRED_VOICE_NAMES.french
+    : PREFERRED_VOICE_NAMES.english;
+  let score = 0;
+
+  if (voiceLanguage === normalizedLanguage) score += 80;
+  if (voiceLanguage.startsWith(`${normalizedLanguage.split("-")[0]}-`)) score += 55;
+  if (voice.localService) score += 18;
+  if (voice.default) score += 8;
+  if (/\b(premium|enhanced|neural|natural)\b/i.test(voiceName)) score += 35;
+  if (LOW_QUALITY_VOICE_PATTERN.test(voiceName)) score -= 100;
+
+  const preferredIndex = preferredNames.findIndex((name) => voiceName.includes(name));
+  if (preferredIndex >= 0) {
+    score += 30 - preferredIndex * 2;
+  }
+
+  return score;
+}
+
+function getBestPlaybackVoice(language, fallback = null) {
+  const languagePrefix = String(language || "").toLowerCase().split("-")[0];
+  const candidates = state.voices.filter((voice) =>
+    String(voice.lang || "").toLowerCase().replace("_", "-").startsWith(languagePrefix)
+  );
+
+  return (
+    candidates.sort(
+      (left, right) =>
+        scorePlaybackVoice(right, language) - scorePlaybackVoice(left, language)
+    )[0] ||
+    fallback ||
+    state.voices[0] ||
+    null
+  );
+}
+
+function getActivePlaybackVoice() {
+  const selectedVoice = getSelectedPlaybackVoice();
+  return isFrenchModeEnabled()
+    ? getBestPlaybackVoice("fr-FR", selectedVoice)
+    : selectedVoice || getBestPlaybackVoice("en-US");
+}
+
+function isFrenchModeEnabled() {
+  return elements.frenchModeButton?.getAttribute("aria-pressed") === "true";
+}
+
+function updateLearningModeControls() {
+  const frenchMode = isFrenchModeEnabled();
+  elements.frenchModeButton?.classList.toggle("is-active", frenchMode);
+
+  if (elements.frenchModeState) {
+    elements.frenchModeState.textContent = frenchMode ? "On" : "Off";
+  }
+
+  if (elements.learningModeNote) {
+    elements.learningModeNote.textContent =
+      elements.educationMode.checked && frenchMode
+        ? "Mode éducatif en français: explications progressives, exemples et exercices."
+        : elements.educationMode.checked
+          ? "Education mode is active: replies will teach step by step with examples."
+          : frenchMode
+            ? "Mode français activé: les réponses et la reconnaissance vocale utilisent le français."
+            : "Education mode explains concepts step by step. French mode can be combined with it.";
+  }
+}
+
+function setFrenchMode(enabled, { announce = false } = {}) {
+  elements.frenchModeButton?.setAttribute("aria-pressed", String(Boolean(enabled)));
+  updateLearningModeControls();
+  syncVoiceInputLanguage();
+
+  if (announce) {
+    elements.liveTranscript.textContent = enabled
+      ? "Mode français activé."
+      : "French mode turned off.";
+  }
+}
+
+function getVoiceInputLanguage() {
+  if (isFrenchModeEnabled()) {
+    return "fr-FR";
+  }
+
+  return (
+    elements.transcriptionLanguage?.value.trim() ||
+    getSelectedPlaybackVoice()?.lang ||
+    navigator.language ||
+    "en-US"
+  );
+}
+
+function syncVoiceInputLanguage() {
+  const language = getVoiceInputLanguage();
+
+  if (state.recognition) {
+    state.recognition.lang = language;
+  }
+
+  if (state.botPromptRecognition) {
+    state.botPromptRecognition.lang = language;
+  }
 }
 
 function populateVoiceOptions() {
@@ -2764,13 +3476,18 @@ function populateVoiceOptions() {
   });
 
   const settings = readSettings();
+  const savedVoice = voices.find((voice) => voice.name === settings.selectedVoice);
+  const bestEnglishVoice = getBestPlaybackVoice("en-US");
   const preferredVoice =
-    voices.find((voice) => voice.name === settings.selectedVoice)?.name ||
-    voices.find((voice) => /^en/i.test(voice.lang))?.name ||
+    (savedVoice && !LOW_QUALITY_VOICE_PATTERN.test(savedVoice.name)
+      ? savedVoice.name
+      : "") ||
+    bestEnglishVoice?.name ||
     voices[0]?.name ||
     "";
 
   elements.voiceSelect.value = preferredVoice;
+  syncVoiceInputLanguage();
   updateSpeechOutputStatus();
 }
 
@@ -2793,7 +3510,8 @@ function populateSpeechModelOptions(models, defaultSpeechModel) {
   const settings = readSettings();
   const preferredSpeechModel =
     models.find((model) => model.id === settings.selectedSpeechModel)?.id ||
-    defaultSpeechModel ||
+    models.find((model) => model.id === defaultSpeechModel)?.id ||
+    models[0]?.id ||
     "";
 
   elements.speechModelSelect.value = preferredSpeechModel;
@@ -3263,7 +3981,16 @@ async function saveWhatsAppConfig() {
   }
 }
 
-async function refreshMicrophones() {
+async function refreshMicrophones({
+  requestPermission = false,
+  activateWake = requestPermission,
+} = {}) {
+  if (requestPermission && !(await requestMicrophonePermission())) {
+    await stopClapWakeMonitor();
+    refreshClapWakeNote();
+    return;
+  }
+
   if (!navigator.mediaDevices?.enumerateDevices) {
     elements.micSelect.innerHTML = "";
     const option = document.createElement("option");
@@ -3271,25 +3998,6 @@ async function refreshMicrophones() {
     option.textContent = "Device listing unavailable";
     elements.micSelect.appendChild(option);
     setStatus(elements.micStatus, "Browser cannot list microphones.", true);
-    await stopClapWakeMonitor();
-    refreshClapWakeNote();
-    return;
-  }
-
-  try {
-    if (navigator.mediaDevices?.getUserMedia) {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
-    }
-  } catch (error) {
-    elements.micSelect.innerHTML = "";
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "Microphone permission required";
-    elements.micSelect.appendChild(option);
-    setStatus(elements.micStatus, "Microphone permission not granted.", true);
-    elements.micNote.textContent =
-      "Allow microphone access in the browser, then refresh mics. Speech recognition uses your system default microphone.";
     await stopClapWakeMonitor();
     refreshClapWakeNote();
     return;
@@ -3304,9 +4012,20 @@ async function refreshMicrophones() {
     if (!microphones.length) {
       const option = document.createElement("option");
       option.value = "";
-      option.textContent = "No microphones detected";
+      option.textContent = canRecordVoiceFallback()
+        ? "System microphone available after tap"
+        : "No microphones detected";
       elements.micSelect.appendChild(option);
-      setStatus(elements.micStatus, "No microphones detected.", true);
+      setStatus(
+        elements.micStatus,
+        canRecordVoiceFallback()
+          ? "Tap a mic button to detect the Apple system microphone"
+          : "No microphones detected.",
+        !canRecordVoiceFallback()
+      );
+      elements.micNote.textContent = canRecordVoiceFallback()
+        ? "Safari may hide microphone devices until recording starts. Tap the mic to use recorded voice input."
+        : elements.micNote.textContent;
       await stopClapWakeMonitor();
       refreshClapWakeNote();
       return;
@@ -3326,10 +4045,17 @@ async function refreshMicrophones() {
 
     const selectedLabel =
       microphones.find((device) => device.deviceId === selectedMicId)?.label || "System default mic";
-    setStatus(elements.micStatus, selectedLabel);
+    setStatus(
+      elements.micStatus,
+      state.microphonePermissionGranted ? selectedLabel : "Tap a mic button to allow access"
+    );
     elements.micNote.textContent =
-      "Browser speech recognition listens to the system default microphone. Use this list to confirm the device labels available on this computer.";
-    await syncClapWakeMonitor();
+      state.microphonePermissionGranted
+        ? "Browser speech recognition listens to the system default microphone."
+        : "On iPhone, microphone permission is requested only after you tap a voice button.";
+    if (state.microphonePermissionGranted && activateWake) {
+      await syncClapWakeMonitor();
+    }
   } catch (error) {
     setStatus(elements.micStatus, `Could not list microphones: ${error.message}`, true);
     await stopClapWakeMonitor();
@@ -3345,26 +4071,33 @@ function setupRecognition() {
   const RecognitionCtor = getRecognitionCtor();
 
   if (!RecognitionCtor) {
+    const hasRecordedFallback = canRecordVoiceFallback();
     setStatus(
       elements.speechSupport,
-      "Speech recognition unavailable. Use Chrome or Edge on http://localhost:3000.",
-      true
+      hasRecordedFallback
+        ? "Apple-compatible recorded voice input ready"
+        : "Speech recognition unavailable in this browser.",
+      !hasRecordedFallback
     );
-    elements.listenButton.disabled = true;
+    elements.listenButton.disabled = !hasRecordedFallback;
+    elements.composerListenButton.disabled = !hasRecordedFallback;
     elements.micNote.textContent =
-      "Open the app on localhost in Chrome or Edge, then allow microphone access.";
+      hasRecordedFallback
+        ? "Tap once to record, then tap again to transcribe with the configured speech-to-text service."
+        : "On iPhone, use Safari over HTTPS. You can still minimize focus mode with the close button.";
     refreshClapWakeNote();
     return;
   }
 
   setStatus(elements.speechSupport, "Speech recognition ready");
-  elements.micNote.textContent =
-    "Speech recognition is available. It will use your system default microphone.";
+  elements.micNote.textContent = isAppleMobileDevice()
+    ? "Apple device detected. Tap once to record, then tap again to transcribe."
+    : "Tap a voice button to request microphone permission.";
 
   const recognition = new RecognitionCtor();
   recognition.continuous = false;
   recognition.interimResults = true;
-  recognition.lang = "en-US";
+  recognition.lang = getVoiceInputLanguage();
 
   const wakePhraseRecognition = new RecognitionCtor();
   wakePhraseRecognition.continuous = true;
@@ -3404,6 +4137,8 @@ function setupRecognition() {
     state.isListening = false;
     updateListeningUi("Voice error", "Start voice input");
     setHeroListeningState(false);
+    setHeroErrorState(true);
+    setFocusModeActive(false);
     elements.liveTranscript.textContent =
       event.error === "not-allowed"
         ? "Microphone permission was denied."
@@ -3419,6 +4154,7 @@ function setupRecognition() {
     updateListeningUi("Idle", "Start voice input");
     setHeroListeningState(false);
     refreshClapWakeNote();
+    void syncClapWakeMonitor();
 
     if (transcript) {
       elements.messageInput.value = transcript;
@@ -3427,6 +4163,8 @@ function setupRecognition() {
       await sendCurrentMessage();
       return;
     }
+
+    setFocusModeActive(false);
 
     if (!elements.liveTranscript.textContent.trim()) {
       elements.liveTranscript.textContent = "Start voice input or type a request below.";
@@ -3615,6 +4353,9 @@ async function prepareSpeechText(text, requestId) {
       body: JSON.stringify({
         text,
         model: selectedSpeechModel,
+        language: isFrenchModeEnabled()
+          ? "fr-FR"
+          : getActivePlaybackVoice()?.lang || navigator.language || "en-US",
       }),
     });
     const payload = await response.json();
@@ -3635,7 +4376,9 @@ async function prepareSpeechText(text, requestId) {
     return (payload.text || text).trim();
   } catch (error) {
     if (requestId === state.speechRequestId) {
-      updateSpeechOutputStatus("Browser voice fallback for this reply");
+      updateSpeechOutputStatus(
+        `Speech polish failed: ${error.message}. Using the original reply.`
+      );
     }
 
     return text;
@@ -3662,7 +4405,8 @@ async function speakText(text) {
     return;
   }
 
-  const voice = state.voices.find((entry) => entry.name === elements.voiceSelect.value);
+  const voice = getActivePlaybackVoice();
+  const speechLanguage = voice?.lang || getVoiceInputLanguage();
   const chunks = splitTextForSpeech(spokenText);
 
   if (!chunks.length) {
@@ -3670,6 +4414,10 @@ async function speakText(text) {
     syncWakePhraseRecognition();
     return;
   }
+
+  updateSpeechOutputStatus(
+    `Playback: ${voice?.name || "browser default"} (${speechLanguage}).`
+  );
 
   const finalizeSpeech = () => {
     if (requestId !== state.speechRequestId) {
@@ -3708,6 +4456,10 @@ async function speakText(text) {
     if (voice) {
       utterance.voice = voice;
     }
+    utterance.lang = speechLanguage;
+    utterance.rate = isFrenchModeEnabled() ? 0.92 : 0.97;
+    utterance.pitch = isFrenchModeEnabled() ? 1 : 1.01;
+    utterance.volume = 1;
 
     utterance.onend = () => {
       if (requestId !== state.speechRequestId) {
@@ -3752,6 +4504,13 @@ function normalizeUsageMode(value) {
 }
 
 function getActiveConversationMessages() {
+  if (
+    state.contextStartIndex < 0 ||
+    (state.messages.length > 0 && state.contextStartIndex >= state.messages.length)
+  ) {
+    state.contextStartIndex = 0;
+  }
+
   return state.messages.slice(state.contextStartIndex);
 }
 
@@ -3846,6 +4605,14 @@ function buildMessages() {
     messages.push({ role: "system", content: systemPrompt });
   }
 
+  if (elements.educationMode.checked) {
+    messages.push({ role: "system", content: EDUCATION_MODE_PROMPT });
+  }
+
+  if (isFrenchModeEnabled()) {
+    messages.push({ role: "system", content: FRENCH_MODE_PROMPT });
+  }
+
   if (state.sessionSummary) {
     messages.push({
       role: "system",
@@ -3874,6 +4641,8 @@ function buildAssistantStatusText() {
     `Model: ${elements.modelSelect.value || "Not selected"}`,
     `Speech polish: ${elements.speechModelSelect.value || "Off"}`,
     `Agent mode: ${elements.agentMode.checked ? "On" : "Off"}`,
+    `Education mode: ${elements.educationMode.checked ? "On" : "Off"}`,
+    `French mode: ${isFrenchModeEnabled() ? "On" : "Off"}`,
     `Internet: ${elements.useInternet.checked ? "On" : "Off"}`,
     `Thinking level: ${state.thinkingLevel}`,
     `Usage display: ${state.usageMode}`,
@@ -4100,8 +4869,12 @@ async function sendCurrentMessage() {
   state.isSending = true;
   elements.sendButton.disabled = true;
   elements.listenButton.disabled = true;
+  setHeroRespondingState(true);
+  setHeroErrorState(false);
+  updateFocusModeUi("Responding", "Responding");
   stopSpeaking();
   const visualExamples = scrapeRequest ? null : updateVisualExamples(userText);
+  const focusInsightRequest = beginFocusInsights(userText);
 
   if (!scrapeRequest) {
     try {
@@ -4136,6 +4909,9 @@ async function sendCurrentMessage() {
       });
       rerenderChat();
       elements.liveTranscript.textContent = "Scrape ready.";
+      finishFocusInsights(focusInsightRequest, userText, assistantReply, {
+        sources: scrape.sources || [],
+      });
       void speakText(assistantReply);
       return;
     }
@@ -4174,6 +4950,7 @@ async function sendCurrentMessage() {
     });
     rerenderChat();
     elements.liveTranscript.textContent = "Reply ready.";
+    finishFocusInsights(focusInsightRequest, userText, assistantReply, payload);
     void speakText(assistantReply);
   } catch (error) {
     if (scrapeRequest) {
@@ -4187,14 +4964,21 @@ async function sendCurrentMessage() {
 
     const failureMessage = scrapeRequest
       ? `I couldn't scrape that page: ${error.message}`
-      : `I hit a problem reaching LM Studio: ${error.message}`;
+      : `LM Studio could not complete the request: ${error.message}`;
     state.messages.push({ role: "assistant", content: failureMessage });
     rerenderChat();
     elements.liveTranscript.textContent = "Something went wrong.";
+    failFocusInsights(focusInsightRequest, error);
   } finally {
     state.isSending = false;
+    setHeroRespondingState(false);
     elements.sendButton.disabled = false;
-    elements.listenButton.disabled = !state.recognition;
+    elements.listenButton.disabled = !isVoiceInputAvailable();
+    elements.composerListenButton.disabled = !isVoiceInputAvailable();
+    updateFocusModeUi(
+      state.isListening ? "Listening" : "Idle",
+      state.isListening ? "Stop voice input" : "Start voice input"
+    );
     saveSettings();
     syncWakePhraseRecognition();
   }
@@ -4220,7 +5004,9 @@ function attachEvents() {
   elements.saveWhatsApp.addEventListener("click", () => {
     saveWhatsAppConfig().catch(() => {});
   });
-  elements.refreshMics.addEventListener("click", refreshMicrophones);
+  elements.refreshMics.addEventListener("click", () => {
+    void refreshMicrophones({ requestPermission: true });
+  });
   elements.startScreenTranscript.addEventListener("click", () => {
     startScreenTranscriptCapture().catch(() => {});
   });
@@ -4362,6 +5148,7 @@ function attachEvents() {
     elements.autoSpeak,
     elements.useInternet,
     elements.agentMode,
+    elements.educationMode,
     elements.clapWake,
     elements.handsFree,
     elements.modelSelect,
@@ -4387,6 +5174,12 @@ function attachEvents() {
     element.addEventListener("change", () => {
       saveSettings();
       updateSpeechOutputStatus();
+      if (
+        element === elements.voiceSelect ||
+        element === elements.transcriptionLanguage
+      ) {
+        syncVoiceInputLanguage();
+      }
       if (element === elements.clapWake) {
         void syncClapWakeMonitor();
         syncWakePhraseRecognition();
@@ -4411,6 +5204,13 @@ function attachEvents() {
 
   elements.listenButton.addEventListener("click", handleListenButtonClick);
   elements.composerListenButton.addEventListener("click", handleListenButtonClick);
+  elements.focusModeButton?.addEventListener("click", handleFocusModeButtonClick);
+  elements.focusModeExit?.addEventListener("click", minimizeFocusMode);
+  elements.frenchModeButton?.addEventListener("click", () => {
+    setFrenchMode(!isFrenchModeEnabled(), { announce: true });
+    saveSettings();
+  });
+  elements.educationMode?.addEventListener("change", updateLearningModeControls);
 
   elements.stopSpeaking.addEventListener("click", stopSpeaking);
   elements.downloadVisualJson.addEventListener("click", () => {
@@ -4430,11 +5230,15 @@ function attachEvents() {
 
   elements.clearChat.addEventListener("click", () => {
     state.messages = [];
+    state.sessionSummary = "";
+    state.contextStartIndex = 0;
+    clearAgentActionQueue();
     resetComposerHistoryNavigation();
     stopSpeaking();
     hideVisualExamples();
     elements.liveTranscript.textContent = "Start voice input or type a request below.";
     rerenderChat();
+    saveSettings();
   });
 
   elements.hideVisualScreen.addEventListener("click", hideVisualExamples);
@@ -4484,6 +5288,8 @@ function applySettings() {
   elements.autoSpeak.checked = settings.autoSpeak;
   elements.useInternet.checked = settings.useInternet;
   elements.agentMode.checked = settings.agentMode;
+  elements.educationMode.checked = Boolean(settings.educationMode);
+  setFrenchMode(Boolean(settings.frenchMode));
   elements.clapWake.checked =
     typeof settings.clapWake === "boolean" ? settings.clapWake : defaults.clapWake;
   elements.handsFree.checked = settings.handsFree;
@@ -4492,8 +5298,9 @@ function applySettings() {
   state.thinkingLevel = normalizeThinkingLevel(settings.thinkingLevel);
   state.usageMode = normalizeUsageMode(settings.usageMode);
   state.verboseAgentMode = Boolean(settings.verboseAgentMode);
-  state.sessionSummary = typeof settings.sessionSummary === "string" ? settings.sessionSummary : "";
-  state.contextStartIndex = Math.max(0, Number(settings.contextStartIndex) || 0);
+  // Conversation messages are session-only, so hidden compacted context must be too.
+  state.sessionSummary = "";
+  state.contextStartIndex = 0;
   state.pendingAgentApproval = settings.pendingAgentApproval || null;
   state.agentActionQueue = normalizeAgentActionQueue(settings.agentActionQueue);
   ensureBotProfiles(settings);
@@ -4517,6 +5324,9 @@ async function initialize() {
   renderClawdSkillLibrary();
   attachEvents();
   setupRecognition();
+  if (shouldStartInFocusMode()) {
+    setFocusModeActive(true);
+  }
   populateVoiceOptions();
   await loadEndpointConfig();
   await refreshMicrophones();

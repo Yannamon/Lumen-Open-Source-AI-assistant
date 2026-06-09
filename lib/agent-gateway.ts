@@ -100,14 +100,14 @@ const TOOL_SCHEMAS: AgentToolSchemaDefinition[] = [
   {
     name: "computer_control_request",
     description:
-      "Perform a safe local computer action like opening an app, controlling Spotify playback, opening VS Code, or reading system info. Do not use this for arbitrary shell commands.",
+      "Perform a safe local computer action like opening apps, controlling music playback, creating Apple Reminders or Calendar events on macOS, opening VS Code, or reading system info. Do not use this for arbitrary shell commands.",
     parameters: {
       type: "object",
       properties: {
         request: {
           type: "string",
           description:
-            "A natural-language request such as 'open VS Code', 'pause Spotify', or 'show system info'.",
+            "A natural-language request such as 'open VS Code', 'pause Spotify', 'remind me to call Sam tomorrow at 9 AM', 'schedule calendar event Design review tomorrow at 2 PM', or 'show system info'.",
         },
       },
       required: ["request"],

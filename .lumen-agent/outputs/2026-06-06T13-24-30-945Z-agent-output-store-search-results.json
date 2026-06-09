@@ -1,0 +1,19 @@
+{
+  "search_results": [
+    {
+      "name": "The Jazz Club",
+      "type": "music",
+      "rating": 4.5
+    },
+    {
+      "name": "Café du Monde",
+      "type": "cuisine",
+      "rating": 4.7
+    },
+    {
+      "name": "Skyline Park",
+      "type": "outdoors",
+      "rating": 4.3
+    }
+  ]
+}

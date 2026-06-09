@@ -1088,7 +1088,13 @@ export function createMastraAgentOrchestrator(deps: AgentWorkflowDependencies) {
     stateSchema: workflowStateSchema,
     execute: async ({ inputData, resumeData, suspend, state, setState }) => {
       if (resumeData?.decisions?.length) {
-        const decisions = new Map(
+        const decisions = new Map<
+          string,
+          {
+            decision: "approve" | "reject";
+            editedArgs: Record<string, any> | undefined;
+          }
+        >(
           resumeData.decisions.map((entry) => [
             entry.id,
             {

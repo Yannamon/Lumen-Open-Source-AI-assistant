@@ -47,9 +47,9 @@ const APP_ROOT = process.cwd();
 const DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234";
 const DEFAULT_ASSISTANT_SYSTEM_PROMPT =
   "You are a warm, capable personal assistant running locally on my computer. Be concise, helpful, proactive, and conversational. If I ask for something ambiguous, make a reasonable assumption and move us forward.";
-let lmStudioBaseUrl = (
+let lmStudioBaseUrl = normalizeLmStudioBaseUrl(
   process.env.LM_STUDIO_BASE_URL || DEFAULT_LM_STUDIO_BASE_URL
-).replace(/\/+$/, "");
+);
 const smtpConfig = {
   host: process.env.SMTP_HOST || "smtp.example.com",
   port: Number(process.env.SMTP_PORT || 465),
@@ -89,9 +89,11 @@ const whatsappConfig = {
   systemPrompt:
     process.env.WHATSAPP_SYSTEM_PROMPT || DEFAULT_ASSISTANT_SYSTEM_PROMPT,
 };
-const INTERNET_SEARCH_PROVIDER = "DuckDuckGo";
+const INTERNET_SEARCH_PROVIDER = "DuckDuckGo + Yahoo";
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/";
+const YAHOO_SEARCH_URL = "https://search.yahoo.com/search";
+const SEARCH_TIMEOUT_MS = 12000;
 const DEFAULT_SPEECH_MODEL = process.env.SPEECH_MODEL || "";
 const SPOTIFY_WEB_URL = "https://open.spotify.com/";
 const RADIO_BROWSER_API_BASE_URL = "https://stations.radioss.app/json";
@@ -100,10 +102,23 @@ const AGENT_TOOL_CALL_LIMIT = 4;
 const ASSISTANT_GUARDRAIL = {
   role: "system",
   content:
-    "You are a local voice assistant. Give direct final answers only. Do not output hidden reasoning, chain-of-thought, or 'thinking process' text unless the user explicitly asks for a brief reasoning summary.",
+    "You are a local voice assistant. Always answer the latest user request. Do not repeat a previous answer unless the latest request explicitly asks you to. Give direct final answers only. Do not output hidden reasoning, chain-of-thought, or 'thinking process' text unless the user explicitly asks for a brief reasoning summary.",
 };
 
-function buildDateTimeContextMessage() {
+function shouldIncludeDateTimeContext(message) {
+  return (
+    typeof message === "string" &&
+    /\b(today|tomorrow|yesterday|tonight|current(?:ly)?|right now|this (?:morning|afternoon|evening|week|month|year)|next (?:week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|last (?:week|month|year)|date|time|day of the week)\b/i.test(
+      message
+    )
+  );
+}
+
+function buildDateTimeContextMessage(message = "") {
+  if (!shouldIncludeDateTimeContext(message)) {
+    return null;
+  }
+
   const now = new Date();
   const timeZone =
     Intl.DateTimeFormat().resolvedOptions().timeZone || "local system timezone";
@@ -115,7 +130,9 @@ function buildDateTimeContextMessage() {
 
   return {
     role: "system",
-    content: `Current local date and time: ${formatted}. Time zone: ${timeZone}. If the user asks for the current time, date, today, tomorrow, or similar, use this exact context rather than guessing.`,
+    content:
+      `Background date/time metadata for interpreting the latest request: ${formatted}. ` +
+      `Time zone: ${timeZone}. Do not answer with this metadata unless the latest user request actually asks for date- or time-related information.`,
   };
 }
 
@@ -134,6 +151,17 @@ function buildInternetGroundingMessage(query, sources) {
       `Answer using only the search sources below when they are relevant. ` +
       `Cite claims inline with [1], [2], etc. If the sources are insufficient, say so clearly.\n\n` +
       serializedSources,
+  };
+}
+
+function buildInternetUnavailableMessage(errorMessage) {
+  return {
+    role: "system",
+    content:
+      "Internet search was requested but is temporarily unavailable. " +
+      "Still answer the user's question from your existing knowledge when possible, " +
+      "and briefly disclose that live web results could not be verified. " +
+      `Search error: ${errorMessage || "No search results were returned."}`,
   };
 }
 
@@ -233,13 +261,21 @@ function getAgentGateway() {
   return agentGateway;
 }
 
-function buildSpeechPolishMessages(text) {
+function buildSpeechPolishMessages(text, language = "") {
+  const normalizedLanguage = String(language || "").toLowerCase();
+  const languageGuidance = normalizedLanguage.startsWith("fr")
+    ? "The text is French. Preserve fluent French phrasing, contractions, liaison-friendly punctuation, and natural sentence rhythm. Do not translate it. "
+    : "Keep the text in its original language. Do not translate it. ";
+
   return [
     {
       role: "system",
       content:
-        "You improve assistant replies for natural browser speech synthesis. " +
-        "Preserve facts, numbers, names, URLs, commands, and intent. " +
+        "Prepare assistant replies for fluent, natural speech synthesis. " +
+        languageGuidance +
+        "Remove markdown syntax while preserving useful pauses and paragraph boundaries. Convert list formatting into natural spoken transitions. " +
+        "Keep sentences varied and conversational instead of making every sentence short. Spell out symbols only when that improves pronunciation. " +
+        "Do not summarize, shorten, add commentary, or change the tone. Preserve every fact, number, name, command, URL destination, and the original intent. " +
         "Return only the final spoken text with no analysis. /no_think",
     },
     {
@@ -354,24 +390,28 @@ function getDirectDateTimeAnswer(message) {
     return null;
   }
 
-  const normalized = message.toLowerCase().trim();
+  const normalized = message.toLowerCase().trim().replace(/[?.!]+$/, "");
+  const asksDateAndTime =
+    /^(?:(?:please|hey|hi)\s+)*(?:(?:can|could|would) you (?:please )?(?:tell|show) me )?(?:what(?:'s| is) the (?:current )?date and time|what date and time is it|current date and time)(?:\s+(?:here|locally|in my timezone))?$/.test(
+      normalized
+    );
   const asksTime =
-    /what time is it|current time|time right now|time now|what's the time|what is the time/.test(
+    /^(?:(?:please|hey|hi)\s+)*(?:(?:can|could|would) you (?:please )?(?:tell|show) me )?(?:what time is it|what(?:'s| is) the (?:current )?time|current time|time right now|time now)(?:\s+(?:here|locally|in my timezone))?$/.test(
       normalized
     );
   const asksDate =
-    /what date is it|current date|today's date|todays date|what day is it|what is today's date|what is todays date/.test(
+    /^(?:(?:please|hey|hi)\s+)*(?:(?:can|could|would) you (?:please )?(?:tell|show) me )?(?:what date is it|current date|today'?s date|what day is it|what is today'?s date)(?:\s+(?:here|locally|in my timezone))?$/.test(
       normalized
     );
 
-  if (!asksTime && !asksDate) {
+  if (!asksDateAndTime && !asksTime && !asksDate) {
     return null;
   }
 
   const now = new Date();
   const { timeZone, time, date, dateTime } = formatDateTimeParts(now);
 
-  if (asksTime && asksDate) {
+  if (asksDateAndTime || (asksTime && asksDate)) {
     return `It is ${dateTime} (${timeZone}).`;
   }
 
@@ -449,6 +489,13 @@ function normalizeBaseUrl(value) {
   return typeof value === "string" ? value.trim().replace(/\/+$/, "") : "";
 }
 
+function normalizeLmStudioBaseUrl(value) {
+  return String(value || DEFAULT_LM_STUDIO_BASE_URL)
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/v1(?:\/(?:models|chat\/completions))?$/i, "");
+}
+
 function normalizeWebhookUrl(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -463,8 +510,6 @@ function looksLikeHtmlDocument(value) {
 }
 
 function openMailtoDraft(mailtoUrl) {
-  const command = process.platform === "win32" ? "start" : "xdg-open";
-
   if (process.platform === "win32") {
     childProcess.spawn("cmd", ["/c", "start", "", mailtoUrl], {
       detached: true,
@@ -474,6 +519,7 @@ function openMailtoDraft(mailtoUrl) {
     return;
   }
 
+  const command = process.platform === "darwin" ? "open" : "xdg-open";
   childProcess.spawn(command, [mailtoUrl], {
     detached: true,
     stdio: "ignore",
@@ -770,6 +816,7 @@ function dedupeSources(sources, limit = 5) {
 async function fetchDuckDuckGoSearchPage(baseUrl, query) {
   const params = new URLSearchParams({ q: query });
   const response = await fetch(`${baseUrl}?${params.toString()}`, {
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
     headers: {
       Accept: "text/html,application/xhtml+xml",
       "Accept-Language": "en-US,en;q=0.9",
@@ -781,6 +828,10 @@ async function fetchDuckDuckGoSearchPage(baseUrl, query) {
 
   if (!response.ok) {
     throw new Error(`Search request failed with status ${response.status}.`);
+  }
+
+  if (/anomaly-modal|challenge-form|Unfortunately, bots use DuckDuckGo too/i.test(html)) {
+    throw new Error("DuckDuckGo blocked the automated search request.");
   }
 
   return html;
@@ -835,6 +886,67 @@ function parseDuckDuckGoLiteResults(html) {
   return dedupeSources(sources);
 }
 
+function extractYahooResultUrl(rawHref) {
+  const href = decodeHtmlEntities(String(rawHref || "").trim());
+
+  try {
+    const parsed = new URL(href);
+    const redirectMatch = parsed.pathname.match(/\/RU=([^/]+)/);
+    const target = redirectMatch ? decodeURIComponent(redirectMatch[1]) : href;
+    const targetUrl = new URL(target);
+    return targetUrl.protocol === "http:" || targetUrl.protocol === "https:"
+      ? targetUrl.toString()
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function parseYahooResults(html) {
+  const blocks =
+    html.match(/<div class="dd (?:lst )?algo algo-sr[\s\S]*?<\/div><\/div><\/li>/gi) ||
+    [];
+  const sources = [];
+
+  for (const block of blocks) {
+    const titleMatch = block.match(
+      /<a[^>]+href="([^"]+)"[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i
+    );
+    const snippetMatch = block.match(
+      /<div class="compText[^"]*"[^>]*>[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i
+    );
+    const url = extractYahooResultUrl(titleMatch?.[1] || "");
+    const title = cleanSearchText(titleMatch?.[2] || "");
+    const snippet = cleanSearchText(snippetMatch?.[1] || "");
+
+    if (url && title) {
+      sources.push({ title, url, snippet });
+    }
+  }
+
+  return dedupeSources(sources);
+}
+
+async function fetchYahooSearchPage(query) {
+  const params = new URLSearchParams({ p: query });
+  const response = await fetch(`${YAHOO_SEARCH_URL}?${params.toString()}`, {
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+      "Accept-Language": "en-US,en;q=0.9",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    },
+  });
+  const html = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Yahoo search failed with status ${response.status}.`);
+  }
+
+  return html;
+}
+
 function runPowerShell(command): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     childProcess.execFile(
@@ -854,6 +966,241 @@ function runPowerShell(command): Promise<{ stdout: string; stderr: string }> {
       }
     );
   });
+}
+
+function escapeAppleScriptString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+async function runAppleScript(script): Promise<{ stdout: string; stderr: string }> {
+  const result = await runLocalCommand("osascript", ["-e", script], { timeoutMs: 15000 });
+  throwIfLocalCommandFailed(result, "AppleScript automation failed.");
+  return {
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+  };
+}
+
+function formatAppleScriptDate(date) {
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
+
+function normalizeMacAppName(target) {
+  const normalized = String(target || "").toLowerCase().trim();
+  const appMap = {
+    spotify: "Spotify",
+    music: "Music",
+    "apple music": "Music",
+    calendar: "Calendar",
+    reminders: "Reminders",
+    reminder: "Reminders",
+    clock: "Clock",
+    alarms: "Clock",
+    alarm: "Clock",
+    safari: "Safari",
+    chrome: "Google Chrome",
+    mail: "Mail",
+    messages: "Messages",
+    facetime: "FaceTime",
+    notes: "Notes",
+    maps: "Maps",
+    photos: "Photos",
+    calculator: "Calculator",
+    terminal: "Terminal",
+    finder: "Finder",
+    settings: "System Settings",
+    "system settings": "System Settings",
+    vscode: "Visual Studio Code",
+    code: "Visual Studio Code",
+    "vs code": "Visual Studio Code",
+    "visual studio code": "Visual Studio Code",
+  };
+
+  return appMap[normalized] || null;
+}
+
+function throwIfLocalCommandFailed(result, fallbackMessage) {
+  if (result?.code === 0) {
+    return;
+  }
+
+  throw new Error(result?.stderr?.trim() || result?.stdout?.trim() || fallbackMessage);
+}
+
+async function openMacApp(target) {
+  if (target === "spotify_web") {
+    const result = await runLocalCommand("open", [SPOTIFY_WEB_URL], { timeoutMs: 10000 });
+    throwIfLocalCommandFailed(result, "Could not open Spotify Web.");
+    return;
+  }
+
+  const appName = normalizeMacAppName(target);
+  if (!appName) {
+    throw new Error(`Unsupported macOS app target: ${target}`);
+  }
+
+  const result = await runLocalCommand("open", ["-a", appName], { timeoutMs: 10000 });
+  throwIfLocalCommandFailed(result, `Could not open ${appName}.`);
+}
+
+async function controlMacMusicPlayback(commandName, target = "music") {
+  const appName = target === "spotify" ? "Spotify" : "Music";
+  const escapedAppName = escapeAppleScriptString(appName);
+  const commands = {
+    play: "play",
+    pause: "pause",
+    next: "next track",
+    previous: "previous track",
+  };
+  const command = commands[commandName];
+
+  if (!command) {
+    throw new Error(`Unsupported music command: ${commandName}`);
+  }
+
+  await openMacApp(target === "spotify" ? "spotify" : "music");
+  await runAppleScript(`tell application "${escapedAppName}" to ${command}`);
+}
+
+function parseTimeOfDay(text) {
+  const match = String(text || "").match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  if (!match) {
+    return null;
+  }
+
+  let hours = Number(match[1]);
+  const minutes = Number(match[2] || 0);
+  const meridiem = match[3]?.toLowerCase() || "";
+
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || minutes > 59) {
+    return null;
+  }
+
+  if (meridiem === "pm" && hours < 12) {
+    hours += 12;
+  } else if (meridiem === "am" && hours === 12) {
+    hours = 0;
+  }
+
+  if (hours > 23) {
+    return null;
+  }
+
+  return { hours, minutes };
+}
+
+function extractDateTimeFromText(text) {
+  const source = String(text || "").trim();
+  const now = new Date();
+  const relativeMatch = source.match(/\bin\s+(\d+)\s+(minute|minutes|hour|hours|day|days|week|weeks)\b/i);
+
+  if (relativeMatch) {
+    const amount = Number(relativeMatch[1]);
+    const unit = relativeMatch[2].toLowerCase();
+    const multiplier = unit.startsWith("minute")
+      ? 60 * 1000
+      : unit.startsWith("hour")
+        ? 60 * 60 * 1000
+        : unit.startsWith("week")
+          ? 7 * 24 * 60 * 60 * 1000
+          : 24 * 60 * 60 * 1000;
+    const date = new Date(now.getTime() + amount * multiplier);
+    return {
+      date,
+      titleText: source.replace(relativeMatch[0], "").replace(/\s+/g, " ").trim(),
+    };
+  }
+
+  const time = parseTimeOfDay(source);
+  let date = new Date(now);
+  let matchedDateText = "";
+  const lower = source.toLowerCase();
+
+  if (/\btomorrow\b/.test(lower)) {
+    date.setDate(date.getDate() + 1);
+    matchedDateText = "tomorrow";
+  } else if (/\btoday\b/.test(lower)) {
+    matchedDateText = "today";
+  } else {
+    const onDateMatch = source.match(/\b(?:on\s+)?([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/i);
+    if (onDateMatch) {
+      const parsed = new Date(onDateMatch[1]);
+      if (!Number.isNaN(parsed.getTime())) {
+        date = parsed;
+        matchedDateText = onDateMatch[0];
+      }
+    }
+  }
+
+  if (!time && !matchedDateText) {
+    const parsed = new Date(source);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    return { date: parsed, titleText: source.replace(/\s+/g, " ").trim() };
+  }
+
+  if (time) {
+    date.setHours(time.hours, time.minutes, 0, 0);
+    if (!matchedDateText && date.getTime() <= now.getTime()) {
+      date.setDate(date.getDate() + 1);
+    }
+  }
+
+  const titleText = source
+    .replace(relativeMatch?.[0] || "", "")
+    .replace(/\btoday\b|\btomorrow\b/gi, "")
+    .replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi, "")
+    .replace(matchedDateText, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return { date, titleText };
+}
+
+async function createAppleReminder({ title, dueDate }) {
+  if (process.platform !== "darwin") {
+    throw new Error("Apple Reminders actions require this assistant server to run on macOS.");
+  }
+
+  const safeTitle = escapeAppleScriptString(title || "Reminder");
+  const dateLine = dueDate
+    ? `set remind me date of newReminder to date "${escapeAppleScriptString(formatAppleScriptDate(dueDate))}"`
+    : "";
+
+  await runAppleScript(`
+tell application "Reminders"
+  set newReminder to make new reminder with properties {name:"${safeTitle}"}
+  ${dateLine}
+end tell
+`);
+}
+
+async function createAppleCalendarEvent({ title, startDate, endDate }) {
+  if (process.platform !== "darwin") {
+    throw new Error("Apple Calendar actions require this assistant server to run on macOS.");
+  }
+
+  const safeTitle = escapeAppleScriptString(title || "New event");
+  const safeStart = escapeAppleScriptString(formatAppleScriptDate(startDate));
+  const safeEnd = escapeAppleScriptString(formatAppleScriptDate(endDate));
+
+  await runAppleScript(`
+tell application "Calendar"
+  set targetCalendar to first calendar whose writable is true
+  tell targetCalendar
+    make new event with properties {summary:"${safeTitle}", start date:date "${safeStart}", end date:date "${safeEnd}"}
+  end tell
+end tell
+`);
 }
 
 async function sendMediaKey(virtualKeyHex) {
@@ -1313,6 +1660,18 @@ async function runDeveloperCommand(commandText) {
     "uv",
     "cargo",
   ]);
+  const macReadOnlyExecutables = new Set([
+    "pwd",
+    "ls",
+    "whoami",
+    "uname",
+    "uptime",
+    "df",
+    "sw_vers",
+  ]);
+  if (process.platform === "darwin") {
+    macReadOnlyExecutables.forEach((name) => allowedExecutables.add(name));
+  }
   const blockedExecutables = new Set(["cmd", "powershell", "pwsh", "bash", "sh", "wsl"]);
   const blockedGitSubcommands = new Set([
     "reset",
@@ -1331,8 +1690,26 @@ async function runDeveloperCommand(commandText) {
 
   if (blockedExecutables.has(executable) || !allowedExecutables.has(executable)) {
     throw new Error(
-      "That command isn't enabled. I can run common developer tools like npm, pnpm, python, pip, git, docker, node, cargo, uv, and pytest."
+      "That command isn't enabled. I can run common developer tools and safe macOS inspection commands such as pwd, ls, whoami, uname, uptime, df, and sw_vers."
     );
+  }
+
+  if (macReadOnlyExecutables.has(executable)) {
+    const allowedArguments = {
+      pwd: new Set(),
+      whoami: new Set(),
+      uptime: new Set(),
+      uname: new Set(["-a", "-m", "-n", "-r", "-s", "-v"]),
+      sw_vers: new Set(["-productName", "-productVersion", "-buildVersion"]),
+      ls: new Set([".", "-a", "-l", "-la", "-al", "-h", "-lh", "-hl"]),
+      df: new Set([".", "-h"]),
+    };
+    const invalidArgument = args.find((argument) => !allowedArguments[executable].has(argument));
+    if (invalidArgument) {
+      throw new Error(
+        `${executable} is limited to safe, read-only options and the current project directory.`
+      );
+    }
   }
 
   if (executable === "git" && blockedGitSubcommands.has(String(args[0] || "").toLowerCase())) {
@@ -1447,6 +1824,26 @@ async function buildSystemInfoReport(scope = "summary") {
 }
 
 async function openWindowsApp(target) {
+  if (process.platform === "darwin") {
+    await openMacApp(target);
+    return;
+  }
+
+  if (process.platform !== "win32") {
+    const appName = {
+      chrome: "google-chrome",
+      calculator: "gnome-calculator",
+      explorer: ".",
+      vscode: "code",
+    }[target];
+    if (appName) {
+      const args = target === "explorer" ? [APP_ROOT] : [];
+      const result = await runLocalCommand(appName, args, { timeoutMs: 10000 });
+      throwIfLocalCommandFailed(result, `Could not open ${target}.`);
+      return;
+    }
+  }
+
   if (target === "spotify_web") {
     await openWebApp(SPOTIFY_WEB_URL);
     return;
@@ -1542,24 +1939,98 @@ function parseComputerControlRequest(message) {
     return { type: "open_app", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
   }
 
+  if (/^(open|launch|start)\s+(?:apple\s+)?music\b/.test(normalized)) {
+    return { type: "open_app", target: "music" };
+  }
+
+  if (/^(open|launch|start)\s+(calendar|reminders?|clock|alarms?|safari|mail|messages|facetime|notes|maps|photos|terminal|finder|system settings|settings)\b/.test(normalized)) {
+    const target = normalized
+      .replace(/^(open|launch|start)\s+/, "")
+      .replace(/^alarm(s)?$/, "clock")
+      .replace(/^reminder$/, "reminders")
+      .trim();
+    return { type: "open_app", target };
+  }
+
+  const openAppleAppMatch = trimmed.match(
+    /^(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?([A-Za-z][A-Za-z ]{1,40})\s*$/i
+  );
+  if (openAppleAppMatch && process.platform === "darwin") {
+    const target = openAppleAppMatch[1].trim().toLowerCase();
+    if (normalizeMacAppName(target)) {
+      return { type: "open_app", target };
+    }
+  }
+
   if (
     /(?:play|resume)\s+(?:music|spotify)|play music on spotify|start spotify music/.test(
       normalized
     )
   ) {
-    return { type: "spotify_play", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
+    const target = /\bspotify\b/.test(normalized)
+      ? wantsSpotifyWeb
+        ? "spotify_web"
+        : "spotify"
+      : process.platform === "darwin"
+        ? "music"
+        : "spotify";
+    return { type: "spotify_play", target };
   }
 
   if (/pause\s+(?:music|spotify)|pause spotify/.test(normalized)) {
-    return { type: "spotify_pause", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
+    return {
+      type: "spotify_pause",
+      target: /\bspotify\b/.test(normalized)
+        ? wantsSpotifyWeb
+          ? "spotify_web"
+          : "spotify"
+        : process.platform === "darwin"
+          ? "music"
+          : "spotify",
+    };
   }
 
   if (/next\s+(?:song|track)|skip\s+(?:song|track)|spotify next/.test(normalized)) {
-    return { type: "media_next", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
+    return { type: "media_next", target: /\bspotify\b/.test(normalized) ? wantsSpotifyWeb ? "spotify_web" : "spotify" : process.platform === "darwin" ? "music" : "spotify" };
   }
 
   if (/previous\s+(?:song|track)|back\s+(?:song|track)|spotify previous/.test(normalized)) {
-    return { type: "media_previous", target: wantsSpotifyWeb ? "spotify_web" : "spotify" };
+    return { type: "media_previous", target: /\bspotify\b/.test(normalized) ? wantsSpotifyWeb ? "spotify_web" : "spotify" : process.platform === "darwin" ? "music" : "spotify" };
+  }
+
+  const reminderMatch = trimmed.match(
+    /^(?:remind\s+me\s+to|set\s+(?:a\s+)?reminder\s+(?:to\s+)?|create\s+(?:a\s+)?reminder\s+(?:to\s+)?|add\s+(?:a\s+)?reminder\s+(?:to\s+)?|set\s+(?:an?\s+)?alarm\s+(?:for\s+)?)\s*([\s\S]+)$/i
+  );
+  if (reminderMatch) {
+    const parsedDate = extractDateTimeFromText(reminderMatch[1]);
+    const title = (parsedDate?.titleText || reminderMatch[1] || "Reminder")
+      .replace(/^(to|for)\s+/i, "")
+      .trim();
+    return {
+      type: "apple_reminder",
+      title: title || (/alarm/i.test(trimmed) ? "Alarm" : "Reminder"),
+      dueDate: parsedDate?.date || null,
+      requestedKind: /alarm/i.test(trimmed) ? "alarm" : "reminder",
+    };
+  }
+
+  const calendarMatch = trimmed.match(
+    /^(?:add|create|schedule)\s+(?:a\s+)?(?:calendar\s+)?(?:event|meeting|appointment)\s+([\s\S]+)$/i
+  );
+  if (calendarMatch) {
+    const parsedDate = extractDateTimeFromText(calendarMatch[1]);
+    if (parsedDate?.date) {
+      const title = (parsedDate.titleText || calendarMatch[1] || "New event")
+        .replace(/^(called|named|for)\s+/i, "")
+        .trim();
+      const endDate = new Date(parsedDate.date.getTime() + 60 * 60 * 1000);
+      return {
+        type: "apple_calendar_event",
+        title: title || "New event",
+        startDate: parsedDate.date,
+        endDate,
+      };
+    }
   }
 
   if (/^(open|launch|start)\s+notepad\b/.test(normalized)) {
@@ -1618,7 +2089,9 @@ function parseComputerControlRequest(message) {
     return { type: "system_info", scope: "memory" };
   }
 
-  const runCommandMatch = trimmed.match(/^(run|execute)\s+(?:command\s+)?(.+)$/i);
+  const runCommandMatch = trimmed.match(
+    /^(run|execute)\s+(?:the\s+)?(?:command\s+)?(.+)$/i
+  );
   if (runCommandMatch) {
     return { type: "run_command", commandText: runCommandMatch[2].trim() };
   }
@@ -1749,6 +2222,12 @@ async function executeComputerControl(action) {
         await controlSpotifyWebPlayback("play");
         return "I opened Spotify Web, focused the player window, and retried the play command.";
       }
+      if (process.platform === "darwin") {
+        await controlMacMusicPlayback("play", action.target || "music");
+        return action.target === "spotify"
+          ? "I opened Spotify and sent the play command."
+          : "I opened Apple Music and sent the play command.";
+      }
       await openWindowsApp(action.target || "spotify");
       await new Promise((resolve) => setTimeout(resolve, 1200));
       await sendMediaKey("0xB3");
@@ -1758,12 +2237,22 @@ async function executeComputerControl(action) {
         await controlSpotifyWebPlayback("pause");
         return "I focused Spotify Web and sent the pause command.";
       }
+      if (process.platform === "darwin") {
+        await controlMacMusicPlayback("pause", action.target || "music");
+        return action.target === "spotify"
+          ? "I sent the Spotify pause command."
+          : "I sent the Apple Music pause command.";
+      }
       await sendMediaKey("0xB3");
       return "I sent the Spotify play or pause media command.";
     case "media_next":
       if (action.target === "spotify_web") {
         await controlSpotifyWebPlayback("next");
         return "I focused Spotify Web and skipped to the next track.";
+      }
+      if (process.platform === "darwin") {
+        await controlMacMusicPlayback("next", action.target || "music");
+        return "I skipped to the next track.";
       }
       await sendMediaKey("0xB0");
       return "I skipped to the next track.";
@@ -1772,8 +2261,27 @@ async function executeComputerControl(action) {
         await controlSpotifyWebPlayback("previous");
         return "I focused Spotify Web and went back to the previous track.";
       }
+      if (process.platform === "darwin") {
+        await controlMacMusicPlayback("previous", action.target || "music");
+        return "I went back to the previous track.";
+      }
       await sendMediaKey("0xB1");
       return "I went back to the previous track.";
+    case "apple_reminder":
+      await createAppleReminder({
+        title: action.title,
+        dueDate: action.dueDate ? new Date(action.dueDate) : null,
+      });
+      return action.requestedKind === "alarm"
+        ? `I created an Apple reminder alarm${action.dueDate ? ` for ${new Date(action.dueDate).toLocaleString()}` : ""}.`
+        : `I created an Apple reminder${action.dueDate ? ` for ${new Date(action.dueDate).toLocaleString()}` : ""}.`;
+    case "apple_calendar_event":
+      await createAppleCalendarEvent({
+        title: action.title,
+        startDate: new Date(action.startDate),
+        endDate: new Date(action.endDate),
+      });
+      return `I added "${action.title}" to Apple Calendar for ${new Date(action.startDate).toLocaleString()}.`;
     case "run_command":
       return await runDeveloperCommand(action.commandText);
     case "system_info":
@@ -2234,6 +2742,17 @@ async function searchInternet(query) {
 
     if (liteSources.length) {
       return liteSources;
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+
+  try {
+    const yahooHtml = await fetchYahooSearchPage(trimmedQuery);
+    const yahooSources = parseYahooResults(yahooHtml);
+
+    if (yahooSources.length) {
+      return yahooSources;
     }
   } catch (error) {
     errors.push(error);
@@ -3231,6 +3750,8 @@ export async function postSpeakResult(body) {
     const text = typeof body.text === "string" ? body.text.trim() : "";
     const requestedModel =
       typeof body.model === "string" && body.model.trim() ? body.model.trim() : "";
+    const language =
+      typeof body.language === "string" && body.language.trim() ? body.language.trim() : "";
     const model = await resolveSpeechPolishModel(requestedModel);
 
     if (!text) {
@@ -3247,19 +3768,19 @@ export async function postSpeakResult(body) {
       method: "POST",
       body: JSON.stringify({
         model,
-        messages: buildSpeechPolishMessages(text),
-        temperature: 0.1,
-        max_tokens: Math.min(180, Math.max(80, Math.ceil(text.length / 2))),
+        messages: buildSpeechPolishMessages(text, language),
+        temperature: 0.15,
+        max_tokens: Math.min(1200, Math.max(120, Math.ceil(text.length / 2))),
       }),
     });
 
-    const rawContent = payload?.choices?.[0]?.message?.content || "";
+    const rawContent = getMessageTextContent(payload?.choices?.[0]?.message);
     const spokenText = stripReasoningBlocks(rawContent) || text;
 
     return createResult(200, {
       text: spokenText,
       model,
-      enhanced: spokenText !== text,
+      enhanced: Boolean(rawContent && spokenText !== text),
     });
   } catch (error) {
     return createResult(502, {
@@ -3640,12 +4161,11 @@ async function executeAgentToolCall(toolCall, options) {
         };
       }
 
-      if (action.type === "run_command" || action.type === "paste_to_codex") {
+      if (action.type === "paste_to_codex") {
         return {
           content: JSON.stringify({
             ok: false,
-            error:
-              "Agent mode does not allow arbitrary shell commands or Codex window automation.",
+            error: "Agent mode does not allow Codex window automation.",
           }),
           sources: [],
         };
@@ -3892,29 +4412,27 @@ async function generateStandardChatResult({
   latestUserContent,
 }) {
   let searchSources = [];
-  const systemMessages = [ASSISTANT_GUARDRAIL, buildDateTimeContextMessage()];
+  let searchError = "";
+  const dateTimeContext = buildDateTimeContextMessage(latestUserContent);
+  const systemMessages = [
+    ASSISTANT_GUARDRAIL,
+    ...(dateTimeContext ? [dateTimeContext] : []),
+  ];
 
   if (useInternet) {
     try {
       searchSources = await searchInternet(latestUserContent || "");
     } catch (error) {
-      return createResult(200, {
-        message: `Internet search is enabled, but I couldn't search right now: ${error.message}`,
-        usage: null,
-        sources: [],
-      });
+      searchError = error.message;
     }
 
-    if (!searchSources.length) {
-      return createResult(200, {
-        message:
-          "Internet search is enabled, but I couldn't find grounded results for that request.",
-        usage: null,
-        sources: [],
-      });
+    if (searchSources.length) {
+      systemMessages.push(
+        buildInternetGroundingMessage(latestUserContent || "", searchSources)
+      );
+    } else {
+      systemMessages.push(buildInternetUnavailableMessage(searchError));
     }
-
-    systemMessages.push(buildInternetGroundingMessage(latestUserContent || "", searchSources));
   }
 
   const payload = await fetchLmStudio("/v1/chat/completions", {
@@ -3997,9 +4515,15 @@ async function generateAgentChatResult({
   temperature,
   maxTokens,
 }) {
+  const latestUserContent =
+    [...messages]
+      .reverse()
+      .find((message) => message?.role === "user" && typeof message.content === "string")
+      ?.content || "";
+  const dateTimeContext = buildDateTimeContextMessage(latestUserContent);
   const agentMessages = [
     ASSISTANT_GUARDRAIL,
-    buildDateTimeContextMessage(),
+    ...(dateTimeContext ? [dateTimeContext] : []),
     buildAgentModeMessage(useInternet),
     ...messages,
   ];
@@ -4134,7 +4658,7 @@ export async function postConfigResult(body) {
       body?.whatsapp && typeof body.whatsapp === "object" ? body.whatsapp : undefined;
 
     if (baseUrl !== undefined) {
-      lmStudioBaseUrl = (baseUrl || DEFAULT_LM_STUDIO_BASE_URL).replace(/\/+$/, "");
+      lmStudioBaseUrl = normalizeLmStudioBaseUrl(baseUrl);
     }
 
     if (smtp) {
@@ -4517,7 +5041,7 @@ export async function postChatResult(body) {
         });
       } catch (error) {
         return createResult(200, {
-          message: `I couldn't control that app: ${error.message}`,
+          message: `I couldn't complete that computer request: ${error.message}`,
           usage: null,
           action: {
             type: "computer_control_error",
